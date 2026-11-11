@@ -1,0 +1,327 @@
+'use client';
+
+import { ItemData, Tag, Category } from '@/lib/content';
+import { Link } from "@/i18n/navigation";
+import { Card, CardBody, cn, Spinner, Tooltip } from '@heroui/react';
+import { FiFolder, FiEye, FiThumbsUp, FiMessageSquare } from 'react-icons/fi';
+import { useFilters } from '@/components/filters/context/filter-context';
+import { getItemPath } from '@/lib/utils';
+import { PromoCodeComponent } from './promo-code';
+import { FavoriteButton } from './favorite-button';
+import { useCurrentUser } from '@/hooks/use-current-user';
+import Image from 'next/image';
+import { shouldShowFallback, isProblematicUrl } from '@/lib/utils/image-domains';
+import { FeaturedBadge } from './featured-items';
+import { useState, memo } from 'react';
+import { createExcerpt } from '@/components/filters/utils/text-utils';
+import { FILTER_CONSTANTS } from '@/components/filters/constants';
+import { useCategoriesEnabled } from '@/hooks/use-categories-enabled';
+import { useTagsEnabled } from '@/hooks/use-tags-enabled';
+import { useItemDistance } from '@/components/filters/context/location-distance-context';
+import { DistanceBadge } from '@/components/ui/distance-badge';
+import { Globe } from 'lucide-react';
+import type { ItemEngagementMetrics } from '@/lib/db/queries/engagement.queries';
+
+type ItemProps = ItemData & {
+	onNavigate?: () => void;
+	layout?: string;
+	hideIndicatorInSimilarProducts?: boolean;
+	engagement?: ItemEngagementMetrics;
+};
+
+function formatCount(n: number): string {
+	if (n >= 1_000_000) return `${(n / 1_000_000).toFixed(1)}M`;
+	if (n >= 1_000) return `${(n / 1_000).toFixed(1)}K`;
+	return `${n}`;
+}
+
+const Item = memo(function Item(props: ItemProps) {
+	const { user } = useCurrentUser();
+	const [isNavigating, setIsNavigating] = useState(false);
+	const { categoriesEnabled } = useCategoriesEnabled();
+	const { tagsEnabled } = useTagsEnabled();
+	const distance = useItemDistance(props.slug);
+
+	const shouldShowFallbackIcon = shouldShowFallback(props.icon_url || '');
+
+	const getTagName = (tag: string | Tag): string => {
+		if (typeof tag === 'string') return tag;
+		if (tag && typeof tag === 'object' && 'name' in tag) return tag.name;
+		return '';
+	};
+	// Locale-free on purpose: the next-intl `Link` below adds the active locale's
+	// prefix itself, so a manual `/${locale}` here rendered `/fr/fr/items/<slug>`.
+	const detailPath = getItemPath(props.slug);
+
+	// Layout checks
+	const isMasonryLayout = props.layout === 'masonry';
+	const isGridLayout = props.layout === 'grid';
+	const isGridOrClassicLayout = isGridLayout || props.layout === 'classic';
+	// Masonry view uses character-based truncation, other layouts use line-clamp
+	const displayDescription = isMasonryLayout
+		? createExcerpt(props.description, FILTER_CONSTANTS.MASONRY_EXCERPT_MAX_CHARS)
+		: props.description;
+
+	const cardClassName = cn(
+		'group relative rounded-sm overflow-hidden border-0 transition-all duration-200',
+		'bg-white dark:bg-white/3',
+		'shadow-sm hover:shadow-md dark:shadow-none',
+		'ring-1 ring-black/[0.06] dark:ring-white/[0.12] hover:ring-black/[0.10] dark:hover:ring-white/[0.40]',
+		isGridLayout ? 'h-[300px] flex flex-col' : 'h-full flex flex-col'
+	);
+
+	const descriptionClassName = cn(
+		'text-[13px] leading-relaxed text-gray-500 dark:text-gray-400',
+		!isMasonryLayout && 'line-clamp-3',
+		isGridOrClassicLayout && 'min-h-[4.5em]'
+	);
+
+	return (
+		<Link
+			href={detailPath}
+			onClick={() => {
+				setIsNavigating(true);
+				props.onNavigate?.();
+			}}
+			className="block h-full"
+		>
+			<Card className={cardClassName}>
+				<CardBody className="flex flex-col gap-4 p-4 h-full">
+					{/* Top row: icon + name */}
+					<div className="flex items-start gap-3 min-w-0 overflow-hidden">
+						{/* Icon */}
+						<div className="shrink-0 w-10 h-10 rounded-xl flex items-center justify-center bg-gray-100 dark:bg-white/5">
+							{shouldShowFallbackIcon ? (
+								<FiFolder className="w-5 h-5 text-gray-400 dark:text-gray-500" />
+							) : (
+								<Image
+									src={props.icon_url!}
+									alt={`${props.name} icon`}
+									className="w-6 h-6 object-contain"
+									width={24}
+									height={24}
+									unoptimized={isProblematicUrl(props.icon_url!)}
+								/>
+							)}
+						</div>
+
+						{/* Name */}
+						<div className="min-h-[2lh] flex items-center min-w-0">
+							<p className="text-sm font-semibold text-text dark:text-text-dark line-clamp-2">
+								{props.name}
+							</p>
+						</div>
+					</div>
+
+					{categoriesEnabled && (
+						<div className="flex items-center gap-2 flex-wrap">
+							{Array.isArray(props.category) ? (
+								props.category.map(
+									(cat, idx) =>
+										cat && (
+											<CategoryFilterButton
+												key={typeof cat === 'string' ? cat : cat.id || idx}
+												category={cat}
+											/>
+										)
+								)
+							) : (
+								<CategoryFilterButton category={props.category} />
+							)}
+						</div>
+					)}
+
+					<div className="space-y-3">
+						{/* Enhanced Description */}
+						<p className={descriptionClassName}>{displayDescription}</p>
+
+						{/* Tags */}
+						{tagsEnabled && props.tags && Array.isArray(props.tags) && props.tags.length > 0 && (
+							<div className="flex flex-wrap gap-1">
+								{props.tags.slice(0, 4).map((tag, index) => {
+									const tagName = getTagName(tag);
+									const tagId = typeof tag === 'string' ? tag : tag.id;
+									if (!tagName) return null;
+									return <TagFilterButton key={tagId || `tag-${index}`} tag={tag} />;
+								})}
+							</div>
+						)}
+					</div>
+					{/* Footer */}
+					<div className="mt-auto pt-2 border-t border-gray-100 dark:border-white/6 flex flex-col gap-2">
+						{props.promo_code && (
+							<PromoCodeComponent
+								promoCode={props.promo_code}
+								variant="compact"
+								showDescription={false}
+								showTerms={false}
+								className="w-full"
+								onCodeCopied={(code) => {
+									if (typeof window !== 'undefined' && (window as any).gtag) {
+										(window as any).gtag('event', 'promo_code_copied', {
+											event_category: 'engagement',
+											event_label: code,
+											item_name: props.name
+										});
+									}
+								}}
+							/>
+						)}
+
+						{/* Actions row */}
+						<div className="flex items-center justify-between gap-2">
+							<div className="flex items-center gap-1">
+								{user?.id && (
+									<Tooltip content="Save to favorites" placement="top" size="sm" showArrow>
+										<span className="inline-flex items-center">
+											<FavoriteButton
+												itemSlug={props.slug}
+												itemName={props.name}
+												itemIconUrl={props.icon_url}
+												itemCategory={
+													Array.isArray(props.category)
+														? typeof props.category[0] === 'string'
+															? props.category[0]
+															: props.category[0]?.name
+														: typeof props.category === 'string'
+															? props.category
+															: props.category?.name
+												}
+												variant="star"
+												size="sm"
+												className="transition-opacity duration-200"
+												hideIndicatorInSimilarProducts={props.hideIndicatorInSimilarProducts}
+											/>
+										</span>
+									</Tooltip>
+								)}
+								{distance !== undefined && <DistanceBadge distance={distance} size="sm" />}
+								{props.featured && (
+									<Tooltip content="Featured" placement="top" size="sm" showArrow>
+										<span className="inline-flex items-center">
+											<FeaturedBadge
+												variant="hero"
+												size="sm"
+												collapsible={true}
+												showText={false}
+												className="text-amber-500 dark:text-amber-400"
+											/>
+										</span>
+									</Tooltip>
+								)}
+							</div>
+
+							{/* Engagement stats */}
+							<div className="flex items-center gap-4 text-[11px] leading-none text-gray-400 dark:text-gray-500">
+								<Tooltip content="Views" placement="top" size="sm" showArrow>
+									<span className="flex items-center gap-1 cursor-default select-none">
+										<FiEye className="w-3 h-3 shrink-0" />
+										<span className="mt-px">{formatCount(props.engagement?.views ?? 0)}</span>
+									</span>
+								</Tooltip>
+								<Tooltip content="Votes" placement="top" size="sm" showArrow>
+									<span className="flex items-center gap-1 cursor-default select-none">
+										<FiThumbsUp className="w-3 h-3 shrink-0" />
+										<span className="mt-px">{formatCount(props.engagement?.votes ?? 0)}</span>
+									</span>
+								</Tooltip>
+								<Tooltip content="Comments" placement="top" size="sm" showArrow>
+									<span className="flex items-center gap-1 cursor-default select-none">
+										<FiMessageSquare className="w-3 h-3 shrink-0" />
+										<span className="mt-px">{formatCount(props.engagement?.comments ?? 0)}</span>
+									</span>
+								</Tooltip>
+								{props.source_url && (
+									<Tooltip content="Visit website" placement="top" size="sm" showArrow>
+										<a
+											href={props.source_url}
+											target="_blank"
+											rel="noopener noreferrer"
+											aria-label={`Visit ${props.name} website`}
+											onClick={(e) => {
+												e.preventDefault();
+												e.stopPropagation();
+												window.open(props.source_url, '_blank', 'noopener,noreferrer');
+											}}
+											className="flex items-center gap-1 text-xs font-medium text-gray-400 dark:text-gray-500 hover:text-primary dark:hover:text-primary transition-colors duration-150 shrink-0"
+										>
+											<Globe className="w-3 h-3 shrink-0" />
+										</a>
+									</Tooltip>
+								)}
+							</div>
+						</div>
+					</div>
+				</CardBody>
+
+				{/* Loading overlay */}
+				{isNavigating && (
+					<div className="absolute inset-0 bg-white/80 dark:bg-[#161616]/80 backdrop-blur-xs rounded-2xl flex items-center justify-center z-50 transition-opacity duration-300">
+						<Spinner size="lg" color="primary" />
+					</div>
+				)}
+			</Card>
+		</Link>
+	);
+});
+
+export default Item;
+
+type CategoryProp = string | Category;
+type TagProp = string | Tag;
+
+const CategoryFilterButton = memo(function CategoryFilterButton({ category }: { category: CategoryProp }) {
+	const { selectedCategories, addSelectedCategory } = useFilters();
+	const categoryId = typeof category === 'string' ? category : category?.id;
+	const categoryName = typeof category === 'string' ? category : category?.name || categoryId;
+	const isActive = selectedCategories.includes(categoryId);
+	return (
+		<button
+			type="button"
+			data-category-filter
+			className={cn(
+				'text-xs font-medium px-2.5 py-1 rounded-full capitalize transition-colors duration-150',
+				'bg-gray-100 dark:bg-white/6 text-gray-600 dark:text-gray-400',
+				'hover:bg-gray-200 hover:text-gray-900 dark:hover:bg-white/8 dark:hover:text-white',
+				isActive && 'bg-gray-200 text-gray-900 dark:bg-white/8 dark:text-white'
+			)}
+			onClick={(e) => {
+				e.preventDefault();
+				e.stopPropagation();
+				if (!isActive) {
+					addSelectedCategory(categoryId);
+				}
+			}}
+		>
+			{categoryName}
+		</button>
+	);
+});
+
+const TagFilterButton = memo(function TagFilterButton({ tag }: { tag: TagProp }) {
+	const { selectedTags, addSelectedTag } = useFilters();
+	const tagId = typeof tag === 'string' ? tag : (tag.id ?? '');
+	const tagName = typeof tag === 'string' ? tag : (tag.name ?? tagId);
+	const isActive = tagId ? selectedTags.includes(tagId) : false;
+
+	return (
+		<button
+			type="button"
+			data-tag-filter
+			className={cn(
+				'text-xs font-medium px-1 py-0.5 rounded transition-colors duration-150',
+				'text-gray-400 dark:text-gray-500 hover:text-gray-700 dark:hover:text-white/70',
+				isActive && 'text-gray-700 dark:text-white/70'
+			)}
+			onClick={(e) => {
+				e.preventDefault();
+				e.stopPropagation();
+				if (!tagId || isActive) return;
+				addSelectedTag(tagId);
+			}}
+			aria-label={`Filter by tag ${tagName}`}
+		>
+			#{tagName}
+		</button>
+	);
+});
