@@ -1,0 +1,693 @@
+"use client";
+
+import { useState } from "react";
+import { useTranslations } from "next-intl";
+
+interface UsageSection {
+  id: string;
+  title: string;
+  description: string;
+  icon: string;
+  color: string;
+  gradient: string;
+  difficulty: "Beginner" | "Intermediate" | "Advanced";
+  estimatedTime: string;
+  content: {
+    type: "code" | "screenshot" | "text" | "terminal";
+    value: string;
+    language?: string;
+    output?: string;
+    explanation?: string;
+  }[];
+  prerequisites: string[];
+  nextSteps: string[];
+}
+
+export function UsageGuide() {
+  const [activeSection, setActiveSection] = useState("creating-items");
+  const [activeTab, setActiveTab] = useState("code");
+  const [isRunning, setIsRunning] = useState(false);
+  const [output, setOutput] = useState("");
+  const t = useTranslations("help");
+
+  const getDifficultyLabel = (difficulty: "Beginner" | "Intermediate" | "Advanced") => {
+    switch (difficulty) {
+      case "Beginner":
+        return t("DIFFICULTY_BEGINNER");
+      case "Intermediate":
+        return t("DIFFICULTY_INTERMEDIATE");
+      case "Advanced":
+        return t("DIFFICULTY_ADVANCED");
+      default:
+        return difficulty;
+    }
+  };
+
+  const usageSections: UsageSection[] = [
+    {
+      id: "creating-items",
+      title: t("USAGE_CREATING_ITEMS_TITLE"),
+      description: t("USAGE_CREATING_ITEMS_DESC"),
+      icon: "📝",
+      color: "text-neutral-900 dark:text-white",
+      gradient: "from-neutral-700 to-neutral-900",
+      difficulty: "Beginner",
+      estimatedTime: "10-15 minutes",
+      prerequisites: [
+        t("USAGE_PREREQ_BASIC_JS"),
+        t("USAGE_PREREQ_API_ACCESS"),
+        t("USAGE_PREREQ_AUTH_SETUP")
+      ],
+      nextSteps: [
+        t("USAGE_NEXT_ITEM_VALIDATION"),
+        t("USAGE_NEXT_FILE_UPLOADS"),
+        t("USAGE_NEXT_CATEGORIES")
+      ],
+      content: [
+        {
+          type: "text",
+          value: "Learn how to create and manage items in your platform using our comprehensive API. This guide covers everything from basic item creation to advanced features like custom fields and media uploads.",
+          explanation: "This section introduces the core concepts of item management and provides practical examples for implementation."
+        },
+        {
+          type: "code",
+          value: `// Example: Creating an item programmatically
+import { createItem } from '@/lib/api';
+
+const newItem = await createItem({
+  title: "Modern Web Application",
+  description: "A powerful application for modern businesses",
+  category: "business",
+  tags: ["web", "business", "productivity"],
+  url: "https://example.com",
+  pricing: "premium",
+  features: [
+    "Real-time collaboration",
+    "Advanced analytics",
+    "API integration"
+  ]
+});`,
+          language: "typescript",
+          output: `✅ Item created successfully!
+ID: item_123456789
+Title: Modern Web Application
+Status: published
+Created: 2024-01-15T10:30:00Z`,
+          explanation: "This code demonstrates how to create a new item using our API with all necessary fields and metadata."
+        },
+        {
+          type: "terminal",
+          value: `npm install @platform/api
+npm run dev
+curl -X POST /api/items \\
+  -H "Content-Type: application/json" \\
+  -d '{"title":"Test Item"}'`,
+          output: `📦 Installing dependencies...
+✅ @platform/api@2.1.0 installed
+🚀 Development server started on http://localhost:3000
+📡 API request sent successfully
+✅ Item created with ID: item_987654321`
+        }
+      ],
+    },
+    {
+      id: "customizing-design",
+      title: t("USAGE_CUSTOMIZING_DESIGN_TITLE"),
+      description: t("USAGE_CUSTOMIZING_DESIGN_DESC"),
+      icon: "🎨",
+      color: "text-neutral-900 dark:text-white",
+      gradient: "from-neutral-700 to-neutral-900",
+      difficulty: "Intermediate",
+      estimatedTime: "20-30 minutes",
+      prerequisites: [
+        t("USAGE_PREREQ_CSS_KNOWLEDGE"),
+        t("USAGE_PREREQ_DESIGN_SYSTEM"),
+        t("USAGE_PREREQ_THEME_CONFIG")
+      ],
+      nextSteps: [
+        t("USAGE_NEXT_CUSTOM_COMPONENTS"),
+        t("USAGE_NEXT_DARK_MODE"),
+        t("USAGE_NEXT_ANIMATIONS")
+      ],
+      content: [
+        {
+          type: "text",
+          value: "Customize your platform's appearance with our flexible theming system. Learn how to modify colors, typography, spacing, and create custom components that match your brand identity.",
+          explanation: "This guide covers advanced theming techniques and best practices for maintaining design consistency."
+        },
+        {
+          type: "code",
+          value: `// Example: Customizing theme colors
+export const customTheme = {
+  primary: "#3b82f6",
+  secondary: "#10b981",
+  accent: "#8b5cf6",
+  background: "#ffffff",
+  surface: "#f8f9fa",
+  text: "#1a1a1a",
+  textSecondary: "#6c757d",
+};
+
+// Apply theme in your component
+function MyComponent() {
+  return (
+    <div className="bg-theme-primary text-white">
+      Custom themed content
+    </div>
+  );
+}`,
+          language: "typescript",
+          output: `🎨 Theme applied successfully!
+Primary: #3b82f6
+Secondary: #10b981
+Accent: #8b5cf6
+✅ Component rendered with custom theme`,
+          explanation: "This example shows how to define and apply custom theme colors throughout your application."
+        }
+      ],
+    },
+    {
+      id: "managing-users",
+      title: t("USAGE_MANAGING_USERS_TITLE"),
+      description: t("USAGE_MANAGING_USERS_DESC"),
+      icon: "👥",
+      color: "text-neutral-900 dark:text-white",
+      gradient: "from-neutral-700 to-neutral-900",
+      difficulty: "Advanced",
+      estimatedTime: "30-45 minutes",
+      prerequisites: [
+        t("USAGE_PREREQ_AUTH_SYSTEM"),
+        t("USAGE_PREREQ_DB_KNOWLEDGE"),
+        t("USAGE_PREREQ_SECURITY")
+      ],
+      nextSteps: [
+        t("USAGE_NEXT_RBAC"),
+        t("USAGE_NEXT_USER_ANALYTICS"),
+        t("USAGE_NEXT_NOTIFICATIONS")
+      ],
+      content: [
+        {
+          type: "text",
+          value: "Implement comprehensive user management with role-based access control, user profiles, and advanced security features. This guide covers authentication, authorization, and user lifecycle management.",
+          explanation: "Advanced user management requires careful consideration of security, scalability, and user experience."
+        },
+        {
+          type: "code",
+          value: `// Example: User role middleware
+import { NextRequest, NextResponse } from 'next/server';
+import { getServerSession } from 'next-auth';
+import { authOptions } from '@/lib/auth';
+
+export async function middleware(request: NextRequest) {
+  const session = await getServerSession(authOptions);
+  
+  if (!session) {
+    return NextResponse.redirect(new URL('/auth/signin', request.url));
+  }
+  
+  // Check user permissions
+  if (request.nextUrl.pathname.startsWith('/admin')) {
+    if (session.user.role !== 'admin') {
+      return NextResponse.redirect(new URL('/unauthorized', request.url));
+    }
+  }
+  
+  return NextResponse.next();
+}`,
+          language: "typescript",
+          output: `🔐 Middleware configured successfully!
+✅ Authentication check enabled
+✅ Role-based access control active
+✅ Admin routes protected
+🛡️ Security headers applied`,
+          explanation: "This middleware ensures proper authentication and authorization for different user roles and protected routes."
+        }
+      ],
+    },
+    {
+      id: "payments-setup",
+      title: t("USAGE_PAYMENTS_SETUP_TITLE"),
+      description: t("USAGE_PAYMENTS_SETUP_DESC"),
+      icon: "💳",
+      color: "text-neutral-900 dark:text-white",
+      gradient: "from-neutral-700 to-neutral-900",
+      difficulty: "Intermediate",
+      estimatedTime: "25-35 minutes",
+      prerequisites: [
+        t("USAGE_PREREQ_STRIPE_ACCOUNT"),
+        t("USAGE_PREREQ_PAYMENT_KNOWLEDGE"),
+        t("USAGE_PREREQ_WEBHOOK_HANDLING")
+      ],
+      nextSteps: [
+        t("USAGE_NEXT_SUBSCRIPTIONS"),
+        t("USAGE_NEXT_REFUNDS"),
+        t("USAGE_NEXT_PAYMENT_ANALYTICS")
+      ],
+      content: [
+        {
+          type: "text",
+          value: "Set up secure payment processing with Stripe integration. Learn how to handle payments, subscriptions, and implement webhooks for real-time payment status updates.",
+          explanation: "Payment integration requires careful attention to security, error handling, and user experience."
+        },
+        {
+          type: "code",
+          value: `// Example: Creating a payment intent
+import { stripe } from '@/lib/stripe';
+
+export async function createPaymentIntent(amount: number, currency = 'usd') {
+  const paymentIntent = await stripe.paymentIntents.create({
+    amount: amount * 100, // Convert to cents
+    currency,
+    metadata: {
+      type: 'platform_subscription',
+      plan: 'premium'
+    }
+  });
+  
+  return {
+    clientSecret: paymentIntent.client_secret,
+    paymentIntentId: paymentIntent.id
+  };
+}
+
+// Usage in API route
+export async function POST(request: Request) {
+  const { amount } = await request.json();
+  
+  try {
+    const { clientSecret } = await createPaymentIntent(amount);
+    return Response.json({ clientSecret });
+  } catch (error) {
+    return Response.json({ error: 'Payment failed' }, { status: 500 });
+  }
+}`,
+          language: "typescript",
+          output: `💳 Payment intent created successfully!
+Amount: $99.00 USD
+Client Secret: pi_3Oq..._secret_abc123
+Status: requires_payment_method
+✅ Ready for payment processing`,
+          explanation: "This code creates a secure payment intent with Stripe and handles the payment flow safely."
+        }
+      ],
+    },
+    {
+      id: "deployment",
+      title: t("USAGE_DEPLOYMENT_TITLE"),
+      description: t("USAGE_DEPLOYMENT_DESC"),
+      icon: "🚀",
+      color: "text-neutral-900 dark:text-white",
+      gradient: "from-neutral-700 to-neutral-900",
+      difficulty: "Beginner",
+      estimatedTime: "15-25 minutes",
+      prerequisites: [
+        t("USAGE_PREREQ_GIT_REPO"),
+        t("USAGE_PREREQ_DEPLOY_ACCOUNT"),
+        t("USAGE_PREREQ_ENV_VARS")
+      ],
+      nextSteps: [
+        t("USAGE_NEXT_CI_CD"),
+        t("USAGE_NEXT_MONITORING"),
+        t("USAGE_NEXT_BACKUPS")
+      ],
+      content: [
+        {
+          type: "text",
+          value: "Deploy your platform to production with confidence. This guide covers various deployment options including Vercel, Docker, and manual deployment with best practices for production environments.",
+          explanation: "Proper deployment ensures your platform is secure, scalable, and performant in production."
+        },
+        {
+          type: "terminal",
+          value: `# Vercel Deployment
+npx vercel
+
+# Or with custom domain
+npx vercel --prod --alias yourdomain.com
+
+# Docker Deployment
+docker build -t my-platform .
+docker run -p 3000:3000 my-platform
+
+# Manual deployment
+npm run build
+npm start`,
+          output: `🚀 Deploying to Vercel...
+📦 Building project...
+✅ Build completed successfully
+🌐 Deploying to production...
+🔗 https://your-platform.vercel.app
+✅ Deployment successful!
+
+🐳 Docker build started...
+📦 Creating image: my-platform
+✅ Image built successfully
+🚀 Container running on port 3000
+
+📦 Building for production...
+✅ Build completed
+🚀 Server started on port 3000`
+        }
+      ],
+    },
+  ];
+
+  const runCode = async () => {
+    setIsRunning(true);
+    setOutput(t("RUNNING_BTN"));
+
+    // Simulate code execution
+    setTimeout(() => {
+      const currentSection = usageSections.find(s => s.id === activeSection);
+      const currentContent = currentSection?.content.find(c => c.type === "code");
+      setOutput(currentContent?.output || "Code executed successfully!");
+      setIsRunning(false);
+    }, 2000);
+  };
+
+  const currentSection = usageSections.find(s => s.id === activeSection);
+
+  return (
+    <section>
+      <div className="max-w-7xl mx-auto">
+        {/* Header */}
+           <div className="mb-6">
+             <p className="text-xs font-medium uppercase tracking-widest text-neutral-400 dark:text-neutral-500 mb-2">{t('USAGE_GUIDE_BADGE')}</p>
+             <h2 className="text-base font-semibold tracking-tight mb-2 text-neutral-900 dark:text-white">{t('USAGE_GUIDE_TITLE')}</h2>
+             <p className="text-neutral-500 dark:text-neutral-400 text-xs max-w-2xl leading-relaxed">{t('USAGE_GUIDE_SUBTITLE')}</p>
+        </div>
+
+        {/* IDE-like Interface */}
+        <div className="bg-white dark:bg-white/3 rounded-xl border border-slate-200 dark:border-white/6 shadow-sm overflow-hidden">
+          {/* IDE Header */}
+          <div className="bg-slate-100 dark:bg-[#0a0a0a] px-6 py-4 border-b border-slate-200 dark:border-white/6">
+            <div className="flex items-center justify-between">
+              <div className="flex items-center gap-4">
+                {/* Window Controls */}
+                <div className="flex items-center space-x-2">
+                  <div className="w-3 h-3 bg-neutral-300 dark:bg-neutral-600 rounded-full"></div>
+                  <div className="w-3 h-3 bg-neutral-400 dark:bg-neutral-500 rounded-full"></div>
+                  <div className="w-3 h-3 bg-neutral-500 dark:bg-neutral-400 rounded-full"></div>
+                </div>
+                
+                {/* File Path */}
+                <div className="text-sm text-slate-600 dark:text-slate-400 font-mono">
+                  docs/usage-guide/{activeSection}.md
+                </div>
+              </div>
+              
+              {/* Actions */}
+              <div className="flex items-center gap-3">
+                <button
+                  onClick={runCode}
+                  disabled={isRunning}
+                  className="h-8 px-3 text-xs font-medium bg-gray-900 dark:bg-white text-white dark:text-gray-900 rounded-md hover:bg-gray-700 dark:hover:bg-gray-100 disabled:opacity-50 transition-colors"
+                >
+                  {isRunning ? t("RUNNING_BTN") : `▶ ${t("RUN_CODE")}`}
+                </button>
+              </div>
+            </div>
+          </div>
+
+          <div className="flex">
+            {/* Sidebar - Section Navigation */}
+            <div className="w-80 bg-slate-50 dark:bg-[#0a0a0a] border-r border-slate-200 dark:border-white/6">
+              <div className="p-4">
+                <h3 className="text-xs font-medium text-slate-500 dark:text-slate-400 mb-3 uppercase tracking-widest">
+                  {t("SECTIONS")}
+                </h3>
+                <div className="space-y-2">
+                  {usageSections.map((section) => (
+                    <button
+                      key={section.id}
+                      onClick={() => setActiveSection(section.id)}
+                      className={`w-full text-left p-3 rounded-lg transition-all duration-300 ${
+                        activeSection === section.id
+                          ? "bg-neutral-100 dark:bg-white/8 border border-neutral-200 dark:border-white/10"
+                          : "hover:bg-slate-100 dark:hover:bg-white/6"
+                      }`}
+                    >
+                      <div className="flex items-center gap-3">
+                        <div className={`w-8 h-8 rounded-lg bg-neutral-900 dark:bg-white/10 flex items-center justify-center text-white text-sm`}>
+                          {section.icon}
+                        </div>
+                        <div className="flex-1">
+                          <div className="font-medium text-slate-900 dark:text-white text-sm">
+                            {section.title}
+                          </div>
+                          <div className="text-xs text-slate-500 dark:text-slate-400">
+                            {section.estimatedTime} • {getDifficultyLabel(section.difficulty)}
+                          </div>
+                        </div>
+                      </div>
+                    </button>
+                  ))}
+                </div>
+              </div>
+            </div>
+
+            {/* Main Content Area */}
+            <div className="flex-1">
+              {/* Content Tabs */}
+              <div className="bg-slate-100 dark:bg-[#0a0a0a] border-b border-slate-200 dark:border-white/6">
+                <div className="flex">
+                  {["code", "output", "docs"].map((tab) => (
+                    <button
+                      key={tab}
+                      onClick={() => setActiveTab(tab)}
+                      className={`px-6 py-3 text-sm font-medium transition-all duration-300 ${
+                        activeTab === tab
+                          ? "bg-white dark:bg-white/5 text-neutral-900 dark:text-white border-b-2 border-neutral-900 dark:border-white"
+                          : "text-slate-600 dark:text-slate-400 hover:text-slate-900 dark:hover:text-white"
+                      }`}
+                    >
+                      {tab === "code" && `💻 ${t("TAB_CODE")}`}
+                      {tab === "output" && `📤 ${t("TAB_OUTPUT")}`}
+                      {tab === "docs" && `📖 ${t("TAB_DOCS")}`}
+                    </button>
+                  ))}
+                </div>
+              </div>
+
+              {/* Tab Content */}
+              <div className="p-4">
+                {activeTab === "code" && (
+                  <div className="space-y-4">
+                    {currentSection?.content.map((content, index) => (
+                      <div key={index}>
+                        {content.type === "text" && (
+                          <div className="bg-slate-50 dark:bg-white/3 rounded-lg p-4 border border-slate-200 dark:border-white/6">
+                            <p className="text-slate-700 dark:text-slate-300 leading-relaxed">
+                              {content.value}
+                            </p>
+                            {content.explanation && (
+                              <div className="mt-3 p-3 bg-neutral-50 dark:bg-white/5 rounded-lg border border-neutral-200 dark:border-white/8">
+                                <p className="text-sm text-neutral-600 dark:text-neutral-400">
+                                  <strong>💡 {t("NOTE_PREFIX")}</strong> {content.explanation}
+                                </p>
+                              </div>
+                            )}
+                          </div>
+                        )}
+
+                        {content.type === "code" && (
+                          <div className="bg-slate-900 rounded-lg border border-slate-700 overflow-hidden shadow-xl">
+                            <div className="bg-slate-800 px-4 py-3 flex items-center justify-between border-b border-slate-700">
+                              <div className="flex items-center space-x-2">
+                                <div className="w-3 h-3 bg-neutral-300 dark:bg-neutral-600 rounded-full"></div>
+                                <div className="w-3 h-3 bg-neutral-400 dark:bg-neutral-500 rounded-full"></div>
+                                <div className="w-3 h-3 bg-neutral-500 dark:bg-neutral-400 rounded-full"></div>
+                              </div>
+                              <div className="text-slate-400 text-sm font-mono">
+                                {content.language || "code"}
+                              </div>
+                            </div>
+                            <div className="p-4 font-mono text-sm overflow-x-auto">
+                              <pre className="text-slate-300 leading-relaxed">
+                                <code>
+                                  {content.value
+                                    .split("\n")
+                                    .map((line, lineIndex) => (
+                                      <div key={lineIndex} className="flex">
+                                        <span className="text-slate-500 mr-4 select-none w-8 text-right">
+                                          {lineIndex + 1}
+                                        </span>
+                                        <span
+                                          className={`${
+                                            line.trim().startsWith("//") ||
+                                            line.trim().startsWith("#")
+                                              ? "text-slate-500"
+                                              : line.includes("import") ||
+                                                line.includes("export")
+                                              ? "text-blue-400"
+                                              : line.includes("const") ||
+                                                line.includes("let") ||
+                                                line.includes("var")
+                                              ? "text-purple-400"
+                                              : line.includes("function") ||
+                                                line.includes("async") ||
+                                                line.includes("await")
+                                              ? "text-green-400"
+                                              : line.includes("return")
+                                              ? "text-yellow-400"
+                                              : "text-slate-300"
+                                          }`}
+                                        >
+                                          {line}
+                                        </span>
+                                      </div>
+                                    ))}
+                                </code>
+                              </pre>
+                            </div>
+                          </div>
+                        )}
+
+                        {content.type === "terminal" && (
+                          <div className="bg-black rounded-lg border border-slate-700 overflow-hidden shadow-xl">
+                            <div className="bg-slate-800 px-4 py-3 flex items-center justify-between border-b border-slate-700">
+                              <div className="flex items-center space-x-2">
+                                <span className="text-green-400">●</span>
+                                <span className="text-slate-400 text-sm">{t("TERMINAL")}</span>
+                              </div>
+                            </div>
+                            <div className="p-4 font-mono text-sm">
+                              <div className="text-green-400 mb-2">$ {content.value}</div>
+                              <div className="text-slate-300">{content.output}</div>
+                            </div>
+                          </div>
+                        )}
+                      </div>
+                    ))}
+                  </div>
+                )}
+
+                {activeTab === "output" && (
+                  <div className="bg-black rounded-lg border border-slate-700 p-4 font-mono text-sm">
+                    <div className="text-green-400 mb-2">$ {t("OUTPUT_PREFIX")}</div>
+                    <div className="text-slate-300 whitespace-pre-wrap">
+                      {output || t("NO_OUTPUT")}
+                    </div>
+                  </div>
+                )}
+
+                {activeTab === "docs" && (
+                  <div className="space-y-6">
+                    {/* Prerequisites */}
+                    <div>
+                      <h4 className="text-xs font-semibold text-slate-900 dark:text-white mb-2 flex items-center gap-2">
+                        <span>📋</span>
+                        {t("PREREQUISITES")}
+                      </h4>
+                      <div className="bg-slate-50 dark:bg-white/3 rounded-lg p-4 border border-slate-200 dark:border-white/6">
+                        <ul className="space-y-2">
+                          {currentSection?.prerequisites.map((prereq, index) => (
+                            <li key={index} className="flex items-center gap-2 text-slate-700 dark:text-slate-300">
+                              <div className="w-2 h-2 bg-neutral-400 dark:bg-neutral-500 rounded-full"></div>
+                              {prereq}
+                            </li>
+                          ))}
+                        </ul>
+                      </div>
+                    </div>
+
+                    {/* Next Steps */}
+                    <div>
+                      <h4 className="text-xs font-semibold text-slate-900 dark:text-white mb-2 flex items-center gap-2">
+                        <span className="">🚀</span>
+                        {t("NEXT_STEPS_LABEL")}
+                      </h4>
+                      <div className="bg-slate-50 dark:bg-white/3 rounded-lg p-4 border border-slate-200 dark:border-white/6">
+                        <ul className="space-y-2">
+                          {currentSection?.nextSteps.map((step, index) => (
+                            <li key={index} className="flex items-center gap-2 text-xs text-slate-700 dark:text-slate-300">
+                              <div className="w-2 h-2 bg-neutral-400 dark:bg-neutral-500 rounded-full"></div>
+                              {step}
+                            </li>
+                          ))}
+                        </ul>
+                      </div>
+                    </div>
+                  </div>
+                )}
+              </div>
+            </div>
+          </div>
+        </div>
+
+        {/* Best Practices */}
+        <div className="mt-8">
+          <div className="bg-gray-50 dark:bg-white/3 rounded-xl p-6 border border-gray-100 dark:border-white/6">
+            <h3 className="text-sm font-semibold text-slate-900 dark:text-white mb-3">
+              {t("USAGE_BEST_PRACTICES_TITLE")}
+            </h3>
+            <div className="grid grid-cols-1 md:grid-cols-2 gap-4">
+              <div className="bg-white dark:bg-white/3 rounded-lg p-4 border border-slate-200 dark:border-white/6">
+                <div className="flex items-start gap-3">
+                  <div className="w-7 h-7 bg-neutral-900 dark:bg-white/10 rounded-md flex items-center justify-center shrink-0">
+                    <span className="text-white dark:text-neutral-400 text-xs">✓</span>
+                  </div>
+                  <div>
+                    <h4 className="font-semibold text-slate-900 dark:text-white mb-2">
+                      {t("USAGE_BEST_PRACTICE_1_TITLE")}
+                    </h4>
+                    <p className="text-slate-600 dark:text-slate-400 text-sm leading-relaxed">
+                      {t("USAGE_BEST_PRACTICE_1_DESC")}
+                    </p>
+                  </div>
+                </div>
+              </div>
+              
+              <div className="bg-white dark:bg-white/3 rounded-lg p-4 border border-slate-200 dark:border-white/6">
+                <div className="flex items-start gap-3">
+                  <div className="w-7 h-7 bg-neutral-900 dark:bg-white/10 rounded-md flex items-center justify-center shrink-0">
+                    <span className="text-white dark:text-neutral-400 text-xs">🔒</span>
+                  </div>
+                  <div>
+                    <h4 className="font-semibold text-slate-900 dark:text-white mb-2">
+                      {t("USAGE_BEST_PRACTICE_2_TITLE")}
+                    </h4>
+                    <p className="text-slate-600 dark:text-slate-400 text-sm leading-relaxed">
+                      {t("USAGE_BEST_PRACTICE_2_DESC")}
+                    </p>
+                  </div>
+                </div>
+              </div>
+              
+              <div className="bg-white dark:bg-white/3 rounded-lg p-4 border border-slate-200 dark:border-white/6">
+                <div className="flex items-start gap-3">
+                  <div className="w-7 h-7 bg-neutral-900 dark:bg-white/10 rounded-md flex items-center justify-center shrink-0">
+                    <span className="text-white dark:text-neutral-400 text-xs">⚡</span>
+                  </div>
+                  <div>
+                    <h4 className="font-semibold text-slate-900 dark:text-white mb-2">
+                      {t("USAGE_BEST_PRACTICE_3_TITLE")}
+                    </h4>
+                    <p className="text-slate-600 dark:text-slate-400 text-sm leading-relaxed">
+                      {t("USAGE_BEST_PRACTICE_3_DESC")}
+                    </p>
+                  </div>
+                </div>
+              </div>
+              
+              <div className="bg-white dark:bg-white/3 rounded-lg p-4 border border-slate-200 dark:border-white/6">
+                <div className="flex items-start gap-3">
+                  <div className="w-7 h-7 bg-neutral-900 dark:bg-white/10 rounded-md flex items-center justify-center shrink-0">
+                    <span className="text-white dark:text-neutral-400 text-xs">📊</span>
+                  </div>
+                  <div>
+                    <h4 className="font-semibold text-slate-900 dark:text-white mb-2">
+                      {t("USAGE_BEST_PRACTICE_4_TITLE")}
+                    </h4>
+                    <p className="text-slate-600 dark:text-slate-400 text-sm leading-relaxed">
+                      {t("USAGE_BEST_PRACTICE_4_DESC")}
+                    </p>
+                  </div>
+                </div>
+              </div>
+            </div>
+          </div>
+        </div>
+      </div>
+    </section>
+  );
+}
