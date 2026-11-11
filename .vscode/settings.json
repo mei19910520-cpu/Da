@@ -1,0 +1,17 @@
+{
+    "i18n-ally.localesPaths": [
+        "messages"
+    ],
+    "i18n-ally.keystyle": "nested",
+    "deepscan.enable": true,
+    "postman.settings.dotenv-detection-notification-visibility": false,
+    "cSpell.words": [
+        "LEMONSQUEEZY",
+        "NEXTAUTH",
+        "NOVU",
+        "POSTHOG",
+        "Squeezy",
+        "SUPABASE",
+        "Vercel"
+    ]
+}
