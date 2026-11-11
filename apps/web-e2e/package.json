@@ -1,0 +1,22 @@
+{
+	"name": "@ever-works/web-e2e",
+	"version": "0.0.0",
+	"private": true,
+	"license": "AGPL-3.0",
+	"scripts": {
+		"test:e2e": "playwright test",
+		"test:e2e:ui": "playwright test --ui",
+		"test:e2e:chromium": "playwright test --project=chromium",
+		"test:e2e:headed": "playwright test --headed",
+		"test:e2e:debug": "playwright test --debug",
+		"lint": "echo 'No lint configured for e2e'"
+	},
+	"devDependencies": {
+		"@axe-core/playwright": "^4.11.3",
+		"@ever-works/tsconfig": "workspace:*",
+		"@faker-js/faker": "^10.5.0",
+		"@playwright/test": "^1.58.2",
+		"dotenv": "^16.4.7",
+		"typescript": "^5"
+	}
+}
