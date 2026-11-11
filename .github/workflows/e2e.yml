@@ -1,0 +1,397 @@
+name: E2E Tests
+
+# Playwright e2e suite (4-shard parallel run across 300+ specs).
+#
+# Scope: only the release branches stage / main. PR and develop triggers
+# were removed in 2026-05-27 (see
+# Workspace/knowledge/runbooks/CI_RELEASE_GATES.md) — running 4 shards of
+# Playwright on every PR and every develop push was burning CI minutes
+# without protecting the release branches better than gating on
+# stage/main would. Lightweight CI (Web CI / Docs CI / CodeQL) still
+# runs on PRs to main/develop and catches the cheap failure modes.
+
+permissions:
+  contents: read
+
+on:
+  push:
+    branches: [stage, main]
+  workflow_dispatch:
+    inputs:
+      project:
+        description: 'Playwright project (chromium / firefox / webkit / all)'
+        required: false
+        default: 'chromium'
+        type: string
+      grep:
+        description: 'Run only specs matching this string'
+        required: false
+        type: string
+
+concurrency:
+  group: ${{ github.ref }}-${{ github.workflow }}
+  cancel-in-progress: true
+
+jobs:
+  e2e:
+    name: Playwright (${{ matrix.shard }}/${{ matrix.total }})
+    runs-on: ${{ vars.RUNNER_LINUX_X64_4 || 'ubuntu-latest' }}
+    timeout-minutes: 60
+
+    strategy:
+      fail-fast: false
+      matrix:
+        # Shard the 300+ specs across 4 jobs for parallelism. Each shard
+        # produces its own HTML report; merge into a single artifact at end.
+        shard: [1, 2, 3, 4]
+        total: [4]
+
+    services:
+      postgres:
+        image: postgres:16-alpine
+        env:
+          POSTGRES_USER: postgres
+          POSTGRES_PASSWORD: postgres
+          POSTGRES_DB: postgres
+        ports:
+          - 5432:5432
+        options: >-
+          --health-cmd "pg_isready -U postgres"
+          --health-interval 10s
+          --health-timeout 5s
+          --health-retries 5
+
+    env:
+      # --- Build / runtime ---
+      NODE_ENV: test
+      CI: 'true'
+      NEXT_PUBLIC_APP_URL: http://localhost:3000
+      BASE_URL: http://localhost:3000
+      CONTENT_WARNINGS_SILENT: 'true'
+
+      # --- Database (matches the postgres service above) ---
+      DATABASE_URL: postgresql://postgres:postgres@localhost:5432/postgres
+
+      # --- Auth ---
+      # Fixed in CI so cookies signed by build === cookies verified by test.
+      AUTH_SECRET: ci-e2e-fixed-secret-do-not-use-in-prod-aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa
+      COOKIE_SECRET: ci-e2e-fixed-cookie-secret-do-not-use-in-prod-bbbbbbbbbbbbbbbbbbbbbbbb
+      COOKIE_DOMAIN: localhost
+      COOKIE_SECURE: 'false'
+
+      # --- Seed account credentials the e2e suite expects ---
+      # global-setup.ts reads these via REQUIRED_ENV_VARS.
+      SEED_ADMIN_EMAIL: admin@e2e.local
+      SEED_ADMIN_PASSWORD: AdminPass123!E2E
+      SEED_FAKE_USER_COUNT: '0'
+
+      # --- Content / CMS (avoid hitting real GitHub during build) ---
+      # Use a valid-format URL so `ItemRepository.getGitService()` doesn't
+      # throw "Invalid DATA_REPOSITORY format" on every item/category API
+      # call (which the route then catches as a 500). The placeholder repo
+      # is never actually cloned (apps/web/scripts/clone.cjs no-ops on
+      # fetch errors and we pre-create the `.content` stub below).
+      DATA_REPOSITORY: https://github.com/ever-works/ci-fixture-empty
+      GH_TOKEN: ci-fixture-token-not-used
+
+      # --- Suppress prod-only features that would fail in CI ---
+      NEXT_PUBLIC_DEMO: 'true'
+      AI_CHAT_API_KEY: ''
+      PLATFORM_API_URL: ''
+      PLATFORM_API_SECRET_TOKEN: ''
+      PLATFORM_WORK_ID: ''
+      PLATFORM_SYNC_SECRET: ''
+
+      # --- Vercel env defaults so any code that reads VERCEL_URL doesn't crash ---
+      VERCEL: ''
+      VERCEL_URL: ''
+
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v7
+
+      - name: Setup pnpm
+        uses: pnpm/action-setup@v6
+
+      - name: Setup Node.js
+        uses: actions/setup-node@v7
+        with:
+          node-version: '24'
+          cache: pnpm
+
+      - name: Configure Registry
+        # Resolve npm packages through the internal Verdaccio cache instead of the public
+        # registry. The goal is TRAFFIC REDUCTION; the speed gain is a bonus.
+        #
+        # This repo is pnpm-only, so the shared ever-co/ever-gauzy composite action is NOT
+        # usable here: it opens with `git checkout -- .npmrc yarn.lock` and hard `exit 1`s
+        # when yarn.lock is absent. Its lockfile rewrite is unnecessary anyway -- unlike a
+        # yarn.lock/package-lock.json, pnpm-lock.yaml records NO registry host, so the
+        # `registry=` line below is what actually redirects the tarball downloads.
+        # Verified with a negative control: the same committed pnpm-lock.yaml plus a
+        # blackholed `registry=` makes pnpm exit 1, and pointing it at the VIP installs
+        # cleanly with --frozen-lockfile still satisfied.
+        #
+        # The VIP is a private LAN address, so the choice is made by PROBING it rather
+        # than by hardcoding a runner list: this job falls back to `ubuntu-latest` when
+        # the self-hosted pool is not configured, and a GitHub-hosted runner can never
+        # reach the VIP. Nothing is committed -- the edit lives only in this checkout,
+        # and the paired restore step below removes it again after the install.
+        shell: bash
+        env:
+          VERDACCIO_REGISTRY: ${{ vars.VERDACCIO_REGISTRY }}
+          EXPECT_VIP: ${{ vars.RUNNER_LINUX_X64_4 != '' }}
+        run: |
+          NPMRC_FILES=".npmrc apps/docs/.npmrc"
+
+          # Start from a known state. Self-hosted runners can reuse a checkout, so a
+          # registry line appended by a PREVIOUS run may still be on disk and would
+          # silently win over this run's decision. Not best-effort: if the reset fails
+          # we must not pick a registry from an unknown state.
+          rm -f .npmrc.ci-created
+          for f in $NPMRC_FILES; do
+            if git ls-files --error-unmatch "$f" >/dev/null 2>&1; then
+              if ! git checkout -- "$f"; then
+                echo "::error title=Could not reset registry configuration::git checkout -- $f failed, so a previous run's registry settings may still be in place. Refusing to select a registry from an unknown state."
+                exit 1
+              fi
+            fi
+          done
+
+          REGISTRY=""
+          if [ "$EXPECT_VIP" = "true" ]; then ATTEMPTS=2; else ATTEMPTS=1; fi
+          if [ -n "$VERDACCIO_REGISTRY" ]; then
+            attempt=1
+            while [ "$attempt" -le "$ATTEMPTS" ]; do
+              if curl -fsS --connect-timeout 5 --max-time 15 -o /dev/null "${VERDACCIO_REGISTRY%/}/-/ping"; then
+                REGISTRY="${VERDACCIO_REGISTRY%/}/"
+                echo "Verdaccio VIP is reachable (attempt $attempt) - using the internal npm cache."
+                break
+              fi
+              attempt=$((attempt + 1))
+              if [ "$attempt" -le "$ATTEMPTS" ]; then sleep 3; fi
+            done
+          fi
+
+          if [ -n "$REGISTRY" ]; then
+            for f in $NPMRC_FILES; do
+              if [ ! -f "$f" ]; then
+                # Only the workspace-root file is worth creating. Without this, a
+                # checkout that has no .npmrc would log "using the internal npm cache"
+                # while pnpm quietly resolved from the public registry - a silent
+                # failure of the entire point of this step. The marker tells the
+                # restore step to delete the file rather than leave a stray behind.
+                if [ "$f" != ".npmrc" ]; then continue; fi
+                : > "$f"
+                : > .npmrc.ci-created
+              fi
+              printf '%s\n' "" "registry=$REGISTRY" >> "$f"
+            done
+            echo "npm registry for this install: the internal Verdaccio cache."
+          else
+            if [ -z "$VERDACCIO_REGISTRY" ]; then
+              echo "No internal Verdaccio registry is configured (VERDACCIO_REGISTRY is empty)."
+            else
+              echo "Verdaccio VIP did not answer."
+              # An in-network runner that cannot reach the VIP means the internal cache is
+              # silently unavailable (this fleet has a recurring MetalLB speaker flap that
+              # presents exactly this way). Deliberately a warning, not a failure: a cache
+              # blip must never redden a pipeline the public registry can serve correctly.
+              if [ "$EXPECT_VIP" = "true" ]; then
+                echo "::warning title=Verdaccio VIP unreachable from an in-network runner::${RUNNER_NAME:-unknown} fell back to the committed npm configuration; the internal cache was expected to be reachable here."
+              fi
+            fi
+            # Deliberately no override: the committed .npmrc files decide. apps/docs/.npmrc
+            # pins the Yarn mirror, so naming npmjs here would misdirect anyone reading
+            # this log while investigating where the traffic actually went.
+            echo "npm registry for this install: the repository default, unchanged."
+          fi
+
+      - name: Install workspace dependencies
+        run: pnpm install --frozen-lockfile
+
+      - name: Restore registry configuration
+        # The `registry=` line above is scoped to the install on THIS runner and must
+        # not outlive it, because later steps hand the working tree to builders that
+        # cannot reach a private LAN address:
+        #   - `vercel deploy --archive=tgz` uploads this checkout and re-installs on
+        #     Vercel infrastructure;
+        #   - `docker/build-push-action` ships it as the build context.
+        # Leaving the VIP in .npmrc would point those builds at an unreachable host.
+        # The in-image install is redirected separately and correctly, through the
+        # VERDACCIO_REGISTRY build-arg the Dockerfile already accepts.
+        #
+        # `always()` so a failed install still leaves the checkout clean - self-hosted
+        # runners reuse it.
+        if: always()
+        shell: bash
+        run: |
+          for f in .npmrc apps/docs/.npmrc; do
+            if git ls-files --error-unmatch "$f" >/dev/null 2>&1; then
+              git checkout -- "$f"
+            fi
+          done
+          if [ -f .npmrc.ci-created ]; then
+            # This step created the root .npmrc; it is not in the repo, so restoring
+            # means removing it rather than checking it out.
+            rm -f .npmrc .npmrc.ci-created
+          fi
+          echo "Tracked npm configuration restored to its committed state."
+
+      - name: Install Playwright browsers
+        # Each shard installs only what it needs (chromium by default).
+        run: pnpm --filter @ever-works/web-e2e exec playwright install --with-deps chromium
+
+      - name: Prepare content directory
+        # The Git-CMS loader reads `.works/works.yml` for site config and
+        # `categories.yml` / `tags.yml` / `collections.yml` for taxonomies.
+        # Without `.works/works.yml`, `config.auth` is undefined and the
+        # /auth/signin form never renders — global-setup then times out
+        # waiting for `#email`. Skipping the real DATA_REPOSITORY clone in CI
+        # means we have to stub these files ourselves. We also seed a few
+        # minimal items so the admin list/filter UI tests have something to
+        # render against.
+        run: |
+          mkdir -p apps/web/.content/.works apps/web/.content/data
+          cat > apps/web/.content/.works/works.yml <<'YAML'
+          company_name: E2E
+          item_name: Item
+          items_name: Items
+          copyright_year: 2026
+          content_table: true
+          pagination:
+            type: standard
+            # Low itemsPerPage so our small 3-item CI seed produces
+            # multi-page output — the discover pagination test asserts
+            # `<nav aria-label="pagination">` is rendered.
+            itemsPerPage: 2
+          auth:
+            credentials: true
+          settings:
+            categories_enabled: true
+            tags_enabled: true
+            companies_enabled: true
+            surveys_enabled: true
+            comparisons_enabled: true
+          YAML
+          cat > apps/web/.content/categories.yml <<'YAML'
+          - id: productivity
+            name: Productivity
+          - id: testing
+            name: Testing
+          - id: web-development
+            name: Web Development
+          YAML
+          cat > apps/web/.content/tags.yml <<'YAML'
+          - id: e2e
+            name: E2E
+          - id: sample
+            name: Sample
+          YAML
+          cat > apps/web/.content/collections.yml <<'YAML'
+          - id: e2e-collection
+            name: E2E Collection
+            description: Placeholder collection for CI
+          YAML
+          # Two approved items + one pending so the items-review spec has
+          # something to approve/reject without falling back to its skip
+          # branch on empty content. Every renderable field is set so
+          # the listing components don't surface "undefined" text — the
+          # listing-overall-page-error-state spec asserts < 3 occurrences
+          # of "undefined" in the visible body.
+          for entry in 'sample-item-one|approved' 'sample-item-two|approved' 'sample-item-three|pending'; do
+            slug="${entry%%|*}"
+            status="${entry##*|}"
+            mkdir -p "apps/web/.content/data/$slug"
+            cat > "apps/web/.content/data/$slug/$slug.yml" <<YAML
+          name: Sample ${slug}
+          description: CI placeholder item ${slug}
+          source_url: https://example.com/${slug}
+          icon_url: https://example.com/${slug}/icon.png
+          category: productivity
+          tags:
+            - e2e
+            - sample
+          featured: false
+          status: ${status}
+          submitted_by: admin@e2e.local
+          submitted_at: 2026-01-01 00:00
+          reviewed_by: admin@e2e.local
+          reviewed_at: 2026-01-01 00:00
+          updated_at: 2026-01-01 00:00
+          YAML
+          done
+          # The runtime's hasUsableContent() check requires a `.git`
+          # directory inside `.content/` when DATA_REPOSITORY is set. We
+          # don't actually want CI to clone the real data repo (it
+          # would 401 on the placeholder), so initialize a git repo
+          # here with a dummy `origin` remote matching DATA_REPOSITORY
+          # so isomorphic-git's pull/sync calls have a remote name to
+          # resolve (they swallow network errors on fetch but throw a
+          # MissingParameterError when no remote exists at all).
+          git init --quiet apps/web/.content
+          git -C apps/web/.content remote add origin "$DATA_REPOSITORY"
+          # Persist committer identity in the repo's local config so
+          # runtime calls (isomorphic-git's git.pull) that need a
+          # committer name don't crash with MissingNameError.
+          git -C apps/web/.content config user.email "ci@e2e.local"
+          git -C apps/web/.content config user.name "ci"
+          git -C apps/web/.content config commit.gpgsign false
+          git -C apps/web/.content add .
+          git -C apps/web/.content commit --quiet -m "ci: seed content stub"
+          # Pretend `main` is at this commit on origin too — the git
+          # service walks refs/remotes/origin/main when computing
+          # version / commit info.
+          git -C apps/web/.content branch -M main
+          git -C apps/web/.content update-ref refs/remotes/origin/main HEAD
+
+      - name: Run database migrations
+        # Pushes Drizzle schema to the empty postgres service. Without it
+        # the auth tables don't exist and the suite can't seed an admin.
+        run: pnpm --filter @ever-works/web db:migrate || echo "Migrations skipped (script missing or non-fatal)"
+        continue-on-error: true
+
+      # Admin seeding happens automatically on first request via
+      # instrumentation.ts (DB Init). It honors SEED_ADMIN_* env vars and
+      # is what created the admin in earlier runs. The standalone `db:seed`
+      # script (cli-seed.ts) currently imports a client-only module and
+      # crashes — no need to invoke it here.
+
+      - name: Run e2e tests (shard ${{ matrix.shard }}/${{ matrix.total }})
+        run: |
+          pnpm --filter @ever-works/web-e2e exec playwright test \
+            --project="${{ github.event.inputs.project || 'chromium' }}" \
+            --shard=${{ matrix.shard }}/${{ matrix.total }} \
+            ${{ github.event.inputs.grep && format('--grep="{0}"', github.event.inputs.grep) || '' }}
+
+      - name: Upload Playwright report (shard ${{ matrix.shard }})
+        if: always()
+        uses: actions/upload-artifact@v7
+        with:
+          name: playwright-report-shard-${{ matrix.shard }}
+          path: apps/web-e2e/playwright-report
+          retention-days: 14
+
+      - name: Upload test results (shard ${{ matrix.shard }})
+        if: failure()
+        uses: actions/upload-artifact@v7
+        with:
+          name: playwright-test-results-shard-${{ matrix.shard }}
+          path: apps/web-e2e/test-results
+          retention-days: 7
+
+  summary:
+    name: E2E summary
+    needs: e2e
+    if: always()
+    runs-on: ${{ vars.RUNNER_LINUX_X64_4 || 'ubuntu-latest' }}
+    timeout-minutes: 5
+    steps:
+      - name: Aggregate result
+        run: |
+          if [[ "${{ needs.e2e.result }}" == "success" ]]; then
+            echo "All e2e shards passed ✅"
+          else
+            echo "::error::E2E suite failed (result=${{ needs.e2e.result }})"
+            exit 1
+          fi
