@@ -1,0 +1,625 @@
+name: Kubernetes Deployment
+
+# Dispatched by the Ever Works platform via @ever-works/k8s-plugin's
+# `getWorkflowFilenames()`. The platform pushes the secrets this workflow
+# reads (KUBECONFIG, K8S_TOKEN, K8S_NAMESPACE, registry creds, etc.) before
+# triggering the dispatch.
+
+on:
+    workflow_dispatch:
+        inputs:
+            environment:
+                description: 'Target environment (production, staging, …)'
+                required: true
+                type: string
+                default: production
+    workflow_call:
+        inputs:
+            environment:
+                required: true
+                type: string
+
+permissions:
+    contents: read
+    packages: write
+    deployments: write
+
+concurrency:
+    group: k8s-deployment-${{ github.ref }}-${{ inputs.environment }}
+    cancel-in-progress: true
+
+env:
+    # docker/build-push-action uploads a build record artifact and a job summary for every build.
+    # The record holds every build-arg value in plain text, and on a public repo anyone signed in to
+    # GitHub can download it, so neither is produced. (BuildKit `secrets:` are never recorded.)
+    DOCKER_BUILD_RECORD_UPLOAD: false
+    DOCKER_BUILD_SUMMARY: false
+    NODE_OPTIONS: '--max-old-space-size=4096'
+    # Keep registry settings at job level. GitHub does not allow the
+    # `secrets` context in workflow-level env, and using it there can make
+    # the run fail during workflow startup before any job is created.
+
+jobs:
+    build-and-deploy:
+        # Platform-managed deploys do NOT run here.
+        #
+        # The Ever Works platform deploys server-side: it holds the cluster
+        # kubeconfig itself and applies manifests directly, so no cluster
+        # credential ever reaches a repo and no runner needs network access to
+        # the API server. Two hard reasons this job cannot do the job for a
+        # platform-managed Work:
+        #   * our self-hosted ARC runners have NO egress to the cluster API
+        #     (192.168.1.0/24 is unreachable from runner pods — verified), and
+        #   * a customer repo runs on GitHub-hosted runners, which can never
+        #     reach a private RFC1918 API endpoint at all.
+        # Left un-gated it just fails on every push, which is exactly what it
+        # has been doing.
+        #
+        # Kept, not deleted (no-removal rule): a FORK pointing at its own
+        # reachable cluster is a legitimate use. Set the repo/org variable
+        # GHA_K8S_DEPLOY_ENABLED=true to turn it back on, same shape as
+        # DO_ENABLED for the DigitalOcean steps.
+        if: ${{ vars.GHA_K8S_DEPLOY_ENABLED == 'true' }}
+        runs-on: ${{ vars.RUNNER_LINUX_X64_4 || 'ubuntu-latest' }}
+        env:
+            # K8S_REGISTRY_KIND drives every per-registry conditional below.
+            # Defaults to 'github' when the platform pushed nothing — that's
+            # the zero-config GHCR flow.
+            K8S_REGISTRY_KIND: ${{ secrets.K8S_REGISTRY_KIND || 'github' }}
+            # `auto` mirrors the platform/plugin default. Treat auto like
+            # private for pull-secret creation; an extra pull secret is safe
+            # for public GHCR, while a missing one breaks private repos.
+            K8S_REGISTRY_VISIBILITY: ${{ secrets.K8S_REGISTRY_VISIBILITY || 'auto' }}
+        steps:
+            - name: Echo target environment
+              run: echo "Deploying to ${{ inputs.environment }}"
+
+            - uses: actions/checkout@v4
+
+            # ---- Image tag ------------------------------------------------
+
+            - name: Resolve image tag
+              id: image
+              run: |
+                  set -euo pipefail
+                  REPO_OWNER="$(echo "${{ github.repository_owner }}" | tr '[:upper:]' '[:lower:]')"
+                  REPO_NAME="${{ github.event.repository.name }}"
+                  REGISTRY_OWNER="${{ secrets.K8S_REGISTRY_OWNER }}"
+                  REGISTRY_OWNER="${REGISTRY_OWNER:-$REPO_OWNER}"
+                  REGISTRY_OWNER="$(echo "$REGISTRY_OWNER" | tr '[:upper:]' '[:lower:]')"
+                  SHORT_SHA="${GITHUB_SHA::12}"
+
+                  case "$K8S_REGISTRY_KIND" in
+                      github)
+                          IMAGE_BASE="ghcr.io/$REGISTRY_OWNER"
+                          ;;
+                      dockerhub)
+                          IMAGE_BASE="docker.io/${{ secrets.REGISTRY_USERNAME }}"
+                          ;;
+                      generic)
+                          REG_HOST="${{ secrets.REGISTRY_SERVER }}"
+                          REG_HOST="${REG_HOST#https://}"
+                          REG_HOST="${REG_HOST#http://}"
+                          REG_HOST="${REG_HOST%/}"
+                          IMAGE_BASE="${REG_HOST}/${{ secrets.REGISTRY_USERNAME }}"
+                          ;;
+                      *)
+                          echo "::error::Unknown K8S_REGISTRY_KIND: $K8S_REGISTRY_KIND"
+                          exit 1
+                          ;;
+                  esac
+
+                  echo "image=${IMAGE_BASE}/${REPO_NAME}:${SHORT_SHA}" >> "$GITHUB_OUTPUT"
+                  echo "registry_host=$(echo "$IMAGE_BASE" | cut -d/ -f1)" >> "$GITHUB_OUTPUT"
+                  echo "Image: ${IMAGE_BASE}/${REPO_NAME}:${SHORT_SHA}"
+
+            # ---- Pre-build setup ------------------------------------------
+
+            - name: Setup pnpm
+              uses: pnpm/action-setup@v4
+
+            - name: Setup Node.js
+              uses: actions/setup-node@v4
+              with:
+                  node-version: '26'
+                  cache: pnpm
+
+            # The Dockerfile copies the working tree into the build context
+            # so we don't need a host-side `pnpm install` here. We do it
+            # anyway to surface lockfile drift early (cheap with the cache).
+            - name: Configure Registry
+              # Resolve npm packages through the internal Verdaccio cache instead of the public
+              # registry. The goal is TRAFFIC REDUCTION; the speed gain is a bonus.
+              #
+              # This repo is pnpm-only, so the shared ever-co/ever-gauzy composite action is NOT
+              # usable here: it opens with `git checkout -- .npmrc yarn.lock` and hard `exit 1`s
+              # when yarn.lock is absent. Its lockfile rewrite is unnecessary anyway -- unlike a
+              # yarn.lock/package-lock.json, pnpm-lock.yaml records NO registry host, so the
+              # `registry=` line below is what actually redirects the tarball downloads.
+              # Verified with a negative control: the same committed pnpm-lock.yaml plus a
+              # blackholed `registry=` makes pnpm exit 1, and pointing it at the VIP installs
+              # cleanly with --frozen-lockfile still satisfied.
+              #
+              # The VIP is a private LAN address, so the choice is made by PROBING it rather
+              # than by hardcoding a runner list: this job falls back to `ubuntu-latest` when
+              # the self-hosted pool is not configured, and a GitHub-hosted runner can never
+              # reach the VIP. Nothing is committed -- the edit lives only in this checkout,
+              # and the paired restore step below removes it again after the install.
+              shell: bash
+              env:
+                VERDACCIO_REGISTRY: ${{ vars.VERDACCIO_REGISTRY }}
+                EXPECT_VIP: ${{ vars.RUNNER_LINUX_X64_4 != '' }}
+              run: |
+                NPMRC_FILES=".npmrc apps/docs/.npmrc"
+
+                # Start from a known state. Self-hosted runners can reuse a checkout, so a
+                # registry line appended by a PREVIOUS run may still be on disk and would
+                # silently win over this run's decision. Not best-effort: if the reset fails
+                # we must not pick a registry from an unknown state.
+                rm -f .npmrc.ci-created
+                for f in $NPMRC_FILES; do
+                  if git ls-files --error-unmatch "$f" >/dev/null 2>&1; then
+                    if ! git checkout -- "$f"; then
+                      echo "::error title=Could not reset registry configuration::git checkout -- $f failed, so a previous run's registry settings may still be in place. Refusing to select a registry from an unknown state."
+                      exit 1
+                    fi
+                  fi
+                done
+
+                REGISTRY=""
+                if [ "$EXPECT_VIP" = "true" ]; then ATTEMPTS=2; else ATTEMPTS=1; fi
+                if [ -n "$VERDACCIO_REGISTRY" ]; then
+                  attempt=1
+                  while [ "$attempt" -le "$ATTEMPTS" ]; do
+                    if curl -fsS --connect-timeout 5 --max-time 15 -o /dev/null "${VERDACCIO_REGISTRY%/}/-/ping"; then
+                      REGISTRY="${VERDACCIO_REGISTRY%/}/"
+                      echo "Verdaccio VIP is reachable (attempt $attempt) - using the internal npm cache."
+                      break
+                    fi
+                    attempt=$((attempt + 1))
+                    if [ "$attempt" -le "$ATTEMPTS" ]; then sleep 3; fi
+                  done
+                fi
+
+                if [ -n "$REGISTRY" ]; then
+                  for f in $NPMRC_FILES; do
+                    if [ ! -f "$f" ]; then
+                      # Only the workspace-root file is worth creating. Without this, a
+                      # checkout that has no .npmrc would log "using the internal npm cache"
+                      # while pnpm quietly resolved from the public registry - a silent
+                      # failure of the entire point of this step. The marker tells the
+                      # restore step to delete the file rather than leave a stray behind.
+                      if [ "$f" != ".npmrc" ]; then continue; fi
+                      : > "$f"
+                      : > .npmrc.ci-created
+                    fi
+                    printf '%s\n' "" "registry=$REGISTRY" >> "$f"
+                  done
+                  echo "npm registry for this install: the internal Verdaccio cache."
+                else
+                  if [ -z "$VERDACCIO_REGISTRY" ]; then
+                    echo "No internal Verdaccio registry is configured (VERDACCIO_REGISTRY is empty)."
+                  else
+                    echo "Verdaccio VIP did not answer."
+                    # An in-network runner that cannot reach the VIP means the internal cache is
+                    # silently unavailable (this fleet has a recurring MetalLB speaker flap that
+                    # presents exactly this way). Deliberately a warning, not a failure: a cache
+                    # blip must never redden a pipeline the public registry can serve correctly.
+                    if [ "$EXPECT_VIP" = "true" ]; then
+                      echo "::warning title=Verdaccio VIP unreachable from an in-network runner::${RUNNER_NAME:-unknown} fell back to the committed npm configuration; the internal cache was expected to be reachable here."
+                    fi
+                  fi
+                  # Deliberately no override: the committed .npmrc files decide. apps/docs/.npmrc
+                  # pins the Yarn mirror, so naming npmjs here would misdirect anyone reading
+                  # this log while investigating where the traffic actually went.
+                  echo "npm registry for this install: the repository default, unchanged."
+                fi
+
+            - name: Install dependencies (lockfile check)
+              run: pnpm install --frozen-lockfile
+
+            # ---- Registry login -------------------------------------------
+
+            - name: Restore registry configuration
+              # The `registry=` line above is scoped to the install on THIS runner and must
+              # not outlive it, because later steps hand the working tree to builders that
+              # cannot reach a private LAN address:
+              #   - `vercel deploy --archive=tgz` uploads this checkout and re-installs on
+              #     Vercel infrastructure;
+              #   - `docker/build-push-action` ships it as the build context.
+              # Leaving the VIP in .npmrc would point those builds at an unreachable host.
+              # The in-image install is redirected separately and correctly, through the
+              # VERDACCIO_REGISTRY build-arg the Dockerfile already accepts.
+              #
+              # `always()` so a failed install still leaves the checkout clean - self-hosted
+              # runners reuse it.
+              if: always()
+              shell: bash
+              run: |
+                for f in .npmrc apps/docs/.npmrc; do
+                  if git ls-files --error-unmatch "$f" >/dev/null 2>&1; then
+                    git checkout -- "$f"
+                  fi
+                done
+                if [ -f .npmrc.ci-created ]; then
+                  # This step created the root .npmrc; it is not in the repo, so restoring
+                  # means removing it rather than checking it out.
+                  rm -f .npmrc .npmrc.ci-created
+                fi
+                echo "Tracked npm configuration restored to its committed state."
+
+            - name: Login to GHCR
+              if: env.K8S_REGISTRY_KIND == 'github'
+              uses: docker/login-action@v3
+              with:
+                  registry: ghcr.io
+                  username: ${{ github.actor }}
+                  password: ${{ secrets.GITHUB_TOKEN }}
+
+            - name: Login to Docker Hub
+              if: env.K8S_REGISTRY_KIND == 'dockerhub'
+              uses: docker/login-action@v3
+              with:
+                  username: ${{ secrets.REGISTRY_USERNAME }}
+                  password: ${{ secrets.REGISTRY_PASSWORD }}
+
+            - name: Login to Generic registry
+              if: env.K8S_REGISTRY_KIND == 'generic'
+              uses: docker/login-action@v3
+              with:
+                  registry: ${{ secrets.REGISTRY_SERVER }}
+                  username: ${{ secrets.REGISTRY_USERNAME }}
+                  password: ${{ secrets.REGISTRY_PASSWORD }}
+
+            # ---- Build & push image ---------------------------------------
+
+            - name: Set up Docker Buildx
+              uses: docker/setup-buildx-action@v3
+
+            - name: Build and push image
+              uses: docker/build-push-action@v6
+              with:
+                  context: .
+                  file: Dockerfile
+                  push: true
+                  tags: ${{ steps.image.outputs.image }}
+                  # Explicit OCI labels via the action's `labels:` input
+                  # (rather than only relying on Dockerfile LABEL). buildx
+                  # writes these into the image config in a way GHCR's
+                  # auto-link parser can see — Dockerfile LABEL inside a
+                  # multi-stage build was getting lost on push.
+                  labels: |
+                      org.opencontainers.image.source=https://github.com/${{ github.repository }}
+                      org.opencontainers.image.revision=${{ github.sha }}
+                      org.opencontainers.image.title=${{ github.repository }}
+                  # DATA_REPOSITORY is a URL — fine to ship as a build-arg
+                  # (it ends up in the resulting image as an env var anyway
+                  # if the Dockerfile picks it up). GH_TOKEN, however, is a
+                  # credential and MUST go through BuildKit secrets so it's
+                  # not embedded in build cache layers / image metadata.
+                  build-args: |
+                      DATA_REPOSITORY=https://github.com/${{ github.repository_owner }}/${{ secrets.DATA_REPOSITORY }}
+                      GITHUB_REPOSITORY=${{ github.repository }}
+                      GITHUB_SHA=${{ github.sha }}
+                      VERDACCIO_REGISTRY=${{ vars.VERDACCIO_REGISTRY }}
+                  secrets: |
+                      gh_token=${{ secrets.GH_TOKEN }}
+                      site_git_token_url=${{ secrets.EVER_WORKS_SITE_GIT_TOKEN_URL }}
+                      site_git_token_secret=${{ secrets.EVER_WORKS_SITE_GIT_TOKEN_SECRET }}
+                  # Disable provenance / SBOM attestation. With these on,
+                  # buildx pushes a manifest LIST (image + attestation
+                  # artifact) rather than a single image manifest. GHCR's
+                  # auto-link logic only scans the top-level manifest for
+                  # the `org.opencontainers.image.source` label, so the
+                  # label gets buried under the attestation layer and the
+                  # auto-link silently fails. Side benefit: smaller
+                  # registry footprint and faster pulls.
+                  provenance: false
+                  sbom: false
+                  cache-from: type=gha
+                  cache-to: type=gha,mode=max
+
+            # ---- Kubectl + apply manifests --------------------------------
+
+            - name: Setup kubectl
+              uses: azure/setup-kubectl@v4
+              with:
+                  version: v1.30.4
+
+            - name: Configure kubectl
+              env:
+                  KUBECONFIG_YAML: ${{ secrets.K8S_TOKEN }}
+              run: |
+                  set -euo pipefail
+                  KCFG="$(mktemp -d)/config"
+                  printf '%s' "$KUBECONFIG_YAML" > "$KCFG"
+                  chmod 600 "$KCFG"
+                  echo "KUBECONFIG=$KCFG" >> "$GITHUB_ENV"
+                  kubectl version --client=true
+
+            - name: Ensure namespace
+              env:
+                  NAMESPACE: ${{ secrets.K8S_NAMESPACE || 'ever-works' }}
+              run: |
+                  kubectl create namespace "$NAMESPACE" --dry-run=client -o yaml | kubectl apply -f -
+
+            - name: Provision image-pull secret (private registries)
+              if: env.K8S_REGISTRY_KIND != 'github' || env.K8S_REGISTRY_VISIBILITY != 'public'
+              env:
+                  NAMESPACE: ${{ secrets.K8S_NAMESPACE || 'ever-works' }}
+                  WORK_SLUG: ${{ github.event.repository.name }}
+                  REGISTRY_HOST: ${{ steps.image.outputs.registry_host }}
+                  REGISTRY_USERNAME: ${{ secrets.REGISTRY_USERNAME || github.actor }}
+                  # Password priority:
+                  # 1. REGISTRY_PASSWORD — explicit, used for docker hub / generic registries.
+                  # 2. GITHUB_READ_PACKAGES_TOKEN — fine-grained PAT with
+                  #    `read:packages` that the platform pushes from the user's
+                  #    GitHub plugin settings. Required for private GHCR images
+                  #    because the workflow's built-in GITHUB_TOKEN only has
+                  #    `packages:read` for the workflow's own repo, not for
+                  #    images owned by a different account.
+                  # 3. GITHUB_TOKEN — fallback that works for same-repo GHCR.
+                  # The legacy GITHUB_READ_PACKAGES_TOKEN name is kept in
+                  # the chain for back-compat with older platform pushes.
+                  REGISTRY_PASSWORD: ${{ secrets.REGISTRY_PASSWORD || secrets.GITHUB_READ_PACKAGES_TOKEN || secrets.GITHUB_TOKEN }}
+              run: |
+                  # 🛑 --server-side is REQUIRED here, do not "simplify" it back to a plain
+                  # `kubectl apply -f -`. Client-side apply stamps the ENTIRE object into a
+                  # `kubectl.kubernetes.io/last-applied-configuration` annotation — for a Secret
+                  # that means a second, cleartext-base64 copy of the registry credential in the
+                  # object's METADATA, where it leaks through `-o yaml` dumps, Velero snapshots
+                  # and any tool that redacts `data:` but renders annotations verbatim.
+                  # Found across 109 secrets on ever-k8s, 2026-08-07. Server-side apply records
+                  # ownership in `.metadata.managedFields` instead and writes no annotation.
+                  # `replace --force` also avoids the annotation but deletes and recreates the
+                  # object, leaving a window where a starting pod finds no pull secret.
+                  kubectl create secret docker-registry "${WORK_SLUG}-pull" \
+                      --docker-server="$REGISTRY_HOST" \
+                      --docker-username="$REGISTRY_USERNAME" \
+                      --docker-password="$REGISTRY_PASSWORD" \
+                      -n "$NAMESPACE" \
+                      --dry-run=client -o yaml | kubectl apply --server-side --force-conflicts -f -
+
+            - name: Provision runtime-env secret
+              # Materialize every repo secret as a Kubernetes Secret that the
+              # Deployment mounts via envFrom. The previous hardcoded list of 4
+              # keys (AUTH_SECRET / COOKIE_SECRET / COOKIE_SECURE / DATABASE_URL)
+              # silently dropped everything else the running app needs
+              # (DATA_REPOSITORY, GH_TOKEN, POLAR_*, STRIPE_*, TRIGGER_DEV_*,
+              # POSTHOG_*, RESEND_*, EMAIL_*, NEXT_PUBLIC_*, TENANT_ID,
+              # CRON_SECRET, …). Now we forward all secrets except a deny-list
+              # of workflow/CI-control names that are never runtime env.
+              #
+              # NEXT_PUBLIC_APP_URL / COOKIE_DOMAIN are still derived from the
+              # ingress host (overriding any repo-secret values so the cluster
+              # always serves its actual public hostname).
+              env:
+                  NAMESPACE: ${{ secrets.K8S_NAMESPACE || 'ever-works' }}
+                  WORK_SLUG: ${{ github.event.repository.name }}
+                  REPO_OWNER: ${{ github.repository_owner }}
+                  INGRESS_HOST: ${{ secrets.K8S_INGRESS_HOST }}
+                  ALL_SECRETS_JSON: ${{ toJSON(secrets) }}
+              run: |
+                  set -euo pipefail
+                  # Deny-list: workflow/CI-control secrets, never forwarded to
+                  # the running container. Anything else gets through.
+                  # Excludes: kubectl/registry/CI infra secrets. Everything
+                  # else (DATA_REPOSITORY, GH_TOKEN, DATABASE_*, AUTH_SECRET,
+                  # COOKIE_*, POLAR_*, RESEND_*, STRIPE_*, TRIGGER_DEV_*,
+                  # POSTHOG_*, NEXT_PUBLIC_*, TENANT_ID, CRON_SECRET, …) is
+                  # forwarded to the running pod via envFrom.
+                  SKIP_RE='^(K8S_|REGISTRY_|DOCKERHUB_|DIGITALOCEAN_|GITHUB_|github_token$)'
+                  REPO_OWNER_LC="$(printf '%s' "$REPO_OWNER" | tr '[:upper:]' '[:lower:]')"
+                  ARGS=()
+                  KEYS_FWD=()
+                  while IFS= read -r key; do
+                      [[ -z "$key" ]] && continue
+                      if [[ "$key" =~ $SKIP_RE ]]; then continue; fi
+                      val="$(printf '%s' "$ALL_SECRETS_JSON" | jq -r --arg k "$key" '.[$k] // empty')"
+                      [[ -z "$val" ]] && continue
+                      # DATA_REPOSITORY: the build-arg step composes a full URL
+                      # from a bare repo slug (`https://github.com/${owner}/${slug}`)
+                      # because the Dockerfile's clone step expects a URL. The
+                      # running app also expects a URL at runtime. Mirror the
+                      # same transformation here so the cluster Secret stays
+                      # consistent with the build. Pass through unchanged if
+                      # the secret already looks like a URL/ssh remote.
+                      if [[ "$key" == "DATA_REPOSITORY" && ! "$val" =~ ^(https?://|git@) ]]; then
+                          val="https://github.com/${REPO_OWNER_LC}/${val}"
+                      fi
+                      ARGS+=(--from-literal="${key}=${val}")
+                      KEYS_FWD+=("$key")
+                  done < <(printf '%s' "$ALL_SECRETS_JSON" | jq -r 'keys[]')
+                  # Always derive these from the ingress host so the cluster's
+                  # public hostname is the source of truth (overrides any value
+                  # carried in repo secrets from a prior environment).
+                  if [[ -n "${INGRESS_HOST:-}" ]]; then
+                      ARGS+=(--from-literal=NEXT_PUBLIC_APP_URL="https://${INGRESS_HOST}")
+                      ARGS+=(--from-literal=COOKIE_DOMAIN="${INGRESS_HOST}")
+                  fi
+                  if [[ ${#ARGS[@]} -gt 0 ]]; then
+                      # 🛑 --server-side is REQUIRED here — see the note on the image-pull secret
+                      # above. This one matters even more: this Secret carries EVERY forwarded repo
+                      # secret (DATABASE_URL, AUTH_SECRET, COOKIE_SECRET, …), so a client-side
+                      # `apply` would duplicate the app's entire secret set in cleartext-base64 in
+                      # the object's metadata annotation, not just a registry credential.
+                      kubectl create secret generic "${WORK_SLUG}-runtime-env" -n "$NAMESPACE" \
+                          "${ARGS[@]}" --dry-run=client -o yaml | kubectl apply --server-side --force-conflicts -f -
+                      # Log keys (not values) so we have a paper trail of what
+                      # was forwarded on this deploy.
+                      printf 'Provisioned %s-runtime-env (%d keys): %s\n' \
+                          "$WORK_SLUG" "${#ARGS[@]}" "${KEYS_FWD[*]}"
+                  else
+                      echo "No runtime-env secrets present; skipping ${WORK_SLUG}-runtime-env"
+                  fi
+
+            - name: Render and apply manifests
+              env:
+                  IMAGE: ${{ steps.image.outputs.image }}
+                  WORK_SLUG: ${{ github.event.repository.name }}
+                  WORK_ID: ${{ secrets.TENANT_ID }}
+                  NAMESPACE: ${{ secrets.K8S_NAMESPACE || 'ever-works' }}
+                  REPLICAS: ${{ secrets.K8S_REPLICAS || '1' }}
+                  INGRESS_HOST: ${{ secrets.K8S_INGRESS_HOST }}
+                  INGRESS_CLASS: ${{ secrets.K8S_INGRESS_CLASS }}
+                  TLS_ISSUER: ${{ secrets.K8S_TLS_ISSUER }}
+                  # EW-741 — additional Ingress hosts the platform reconciles
+                  # alongside the primary `K8S_INGRESS_HOST` (the managed
+                  # `*.ever.works` subdomain). Lower-cased, comma-separated,
+                  # deduped by the API's DeployService before the secret is
+                  # pushed. Each host becomes an extra `spec.rules` entry +
+                  # its own `spec.tls` block so cert-manager issues a
+                  # separate cert per host (mixing hosts into one TLS block
+                  # only works when a single wildcard covers them all, which
+                  # we can't assume for customer-supplied custom domains).
+                  EXTRA_HOSTS: ${{ secrets.K8S_EXTRA_HOSTS }}
+              run: |
+                  set -euo pipefail
+
+                  # Pull-secret reference for the Deployment podSpec.
+                  if [[ "$K8S_REGISTRY_KIND" != "github" || "$K8S_REGISTRY_VISIBILITY" != "public" ]]; then
+                      export PULL_SECRET_BLOCK="imagePullSecrets:
+                                - name: ${WORK_SLUG}-pull"
+                  else
+                      export PULL_SECRET_BLOCK=""
+                  fi
+
+                  envsubst < .deploy/k8s-platform/deployment.yaml | kubectl apply -f -
+                  envsubst < .deploy/k8s-platform/service.yaml | kubectl apply -f -
+
+                  # Ingress only when a host is configured.
+                  if [[ -n "$INGRESS_HOST" ]]; then
+                      # Build the controller-specific annotation lines as
+                      # individual `key: value` strings. We render the full
+                      # Ingress YAML below via a heredoc rather than
+                      # envsubst-substituting a multi-line block — that
+                      # approach broke YAML indent because only the first
+                      # line inherited the template's column position and
+                      # subsequent lines were emitted at column 0.
+                      ANNOTATION_LINES=()
+                      case "${INGRESS_CLASS:-}" in
+                          nginx|*nginx*)
+                              ANNOTATION_LINES+=("nginx.ingress.kubernetes.io/proxy-body-size: 10m")
+                              if [[ -n "$TLS_ISSUER" ]]; then
+                                  ANNOTATION_LINES+=("nginx.ingress.kubernetes.io/ssl-redirect: \"true\"")
+                                  ANNOTATION_LINES+=("cert-manager.io/cluster-issuer: $TLS_ISSUER")
+                              else
+                                  ANNOTATION_LINES+=("nginx.ingress.kubernetes.io/ssl-redirect: \"false\"")
+                              fi
+                              ;;
+                          traefik|*traefik*)
+                              if [[ -n "$TLS_ISSUER" ]]; then
+                                  ANNOTATION_LINES+=("traefik.ingress.kubernetes.io/router.entrypoints: websecure")
+                                  ANNOTATION_LINES+=("traefik.ingress.kubernetes.io/router.tls: \"true\"")
+                                  ANNOTATION_LINES+=("cert-manager.io/cluster-issuer: $TLS_ISSUER")
+                              else
+                                  ANNOTATION_LINES+=("traefik.ingress.kubernetes.io/router.entrypoints: web")
+                              fi
+                              ;;
+                          *)
+                              if [[ -n "$TLS_ISSUER" ]]; then
+                                  ANNOTATION_LINES+=("cert-manager.io/cluster-issuer: $TLS_ISSUER")
+                              fi
+                              ;;
+                      esac
+
+                      # EW-741 — primary host (managed `*.ever.works` subdomain
+                      # or whatever the platform pushed via K8S_INGRESS_HOST)
+                      # plus any custom domains the platform reconciles via
+                      # `K8S_EXTRA_HOSTS` (comma-separated). Each host gets
+                      # its own `rules` entry and its own `tls` block. Lower-
+                      # case + dedupe defensively even though the platform
+                      # already normalises the value.
+                      HOSTS=()
+                      seen=" "
+                      add_host() {
+                          local h
+                          h="$(echo "$1" | tr '[:upper:]' '[:lower:]' | tr -d '[:space:]')"
+                          [[ -z "$h" ]] && return 0
+                          [[ "$seen" == *" $h "* ]] && return 0
+                          HOSTS+=("$h")
+                          seen="${seen}$h "
+                      }
+                      add_host "$INGRESS_HOST"
+                      if [[ -n "${EXTRA_HOSTS:-}" ]]; then
+                          IFS=',' read -r -a extras <<<"$EXTRA_HOSTS"
+                          for h in "${extras[@]}"; do add_host "$h"; done
+                      fi
+                      echo "Ingress hosts (${#HOSTS[@]}): ${HOSTS[*]}"
+
+                      # Render Ingress YAML with proper indentation. Each
+                      # annotation gets exactly 8 spaces, matching the
+                      # `metadata.annotations:` parent indent.
+                      {
+                          echo "apiVersion: networking.k8s.io/v1"
+                          echo "kind: Ingress"
+                          echo "metadata:"
+                          echo "    name: ${WORK_SLUG}"
+                          echo "    namespace: ${NAMESPACE}"
+                          echo "    labels:"
+                          echo "        ever-works.io/managed: \"true\""
+                          echo "        ever-works.io/work-id: \"${WORK_ID}\""
+                          echo "        app.kubernetes.io/name: ${WORK_SLUG}"
+                          echo "        app.kubernetes.io/managed-by: ever-works-k8s-plugin"
+                          if [[ ${#ANNOTATION_LINES[@]} -gt 0 ]]; then
+                              echo "    annotations:"
+                              for line in "${ANNOTATION_LINES[@]}"; do
+                                  echo "        $line"
+                              done
+                          fi
+                          echo "spec:"
+                          if [[ -n "${INGRESS_CLASS:-}" ]]; then
+                              echo "    ingressClassName: ${INGRESS_CLASS}"
+                          fi
+                          echo "    rules:"
+                          for host in "${HOSTS[@]}"; do
+                              echo "        - host: ${host}"
+                              echo "          http:"
+                              echo "              paths:"
+                              echo "                  - path: /"
+                              echo "                    pathType: Prefix"
+                              echo "                    backend:"
+                              echo "                        service:"
+                              echo "                            name: ${WORK_SLUG}"
+                              echo "                            port:"
+                              echo "                                number: 80"
+                          done
+                          if [[ -n "$TLS_ISSUER" ]]; then
+                              echo "    tls:"
+                              for host in "${HOSTS[@]}"; do
+                                  TLS_SECRET_NAME="$(echo "$host" | tr -c 'a-z0-9' '-' | sed 's/--*/-/g; s/^-//; s/-$//')-tls"
+                                  echo "        - hosts:"
+                                  echo "              - ${host}"
+                                  echo "          secretName: ${TLS_SECRET_NAME}"
+                              done
+                          fi
+                      } | kubectl apply -f -
+                  fi
+
+            - name: Wait for rollout
+              env:
+                  WORK_SLUG: ${{ github.event.repository.name }}
+                  NAMESPACE: ${{ secrets.K8S_NAMESPACE || 'ever-works' }}
+              run: |
+                  kubectl rollout status "deployment/${WORK_SLUG}" -n "$NAMESPACE" --timeout=10m
+
+            - name: Deployment summary
+              if: success()
+              env:
+                  INGRESS_HOST: ${{ secrets.K8S_INGRESS_HOST }}
+                  EXTRA_HOSTS: ${{ secrets.K8S_EXTRA_HOSTS }}
+                  WORK_SLUG: ${{ github.event.repository.name }}
+                  NAMESPACE: ${{ secrets.K8S_NAMESPACE || 'ever-works' }}
+              run: |
+                  if [[ -n "$INGRESS_HOST" ]]; then
+                      echo "Deployed to https://${INGRESS_HOST}"
+                      if [[ -n "${EXTRA_HOSTS:-}" ]]; then
+                          IFS=',' read -r -a extras <<<"$EXTRA_HOSTS"
+                          for h in "${extras[@]}"; do
+                              h_clean="$(echo "$h" | tr -d '[:space:]')"
+                              [[ -n "$h_clean" ]] && echo "Also serving https://${h_clean}"
+                          done
+                      fi
+                  else
+                      echo "Deployed in cluster: kubectl port-forward svc/${WORK_SLUG} 8080:80 -n ${NAMESPACE}"
+                  fi
