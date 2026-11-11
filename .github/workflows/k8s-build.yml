@@ -1,0 +1,107 @@
+name: k8s-build
+on:
+  workflow_dispatch:
+  push:
+    branches: [develop, stage, main, master]
+concurrency:
+  group: k8s-build-${{ github.ref }}
+  # A push cancels the build that holds this group, as before. A manual dispatch no longer
+  # does: it waits until that build ends (even if the build's jobs are still waiting for a
+  # runner). On 2026-10-05 two Work sites' push builds, queued for a runner, were cancelled
+  # this way by a hand dispatch for the same commit. GitHub still replaces an older PENDING
+  # run in the group with the newest one; that loses nothing, because a dispatch builds the
+  # branch head, which includes the commit of the push it replaced. One group per ref (not
+  # one per event) keeps two builds of a branch from publishing the same image tag at once.
+  cancel-in-progress: ${{ github.event_name == 'push' }}
+permissions:
+  contents: read
+  packages: write
+# docker/build-push-action uploads a build record artifact and a job summary for every build.
+# The record holds every build-arg value in plain text, and on a public repo anyone signed in to
+# GitHub can download it, so neither is produced. (BuildKit `secrets:` are never recorded.)
+env:
+  DOCKER_BUILD_RECORD_UPLOAD: false
+  DOCKER_BUILD_SUMMARY: false
+
+jobs:
+  build:
+    runs-on: ${{ vars.RUNNER_LINUX_X64_4 || 'ubuntu-latest' }}
+    strategy:
+      fail-fast: false
+      matrix:
+        # REPO-AGNOSTIC on purpose. `suffix` (not a literal image name) is what
+        # keeps this file correct after the platform force-pushes it verbatim
+        # into every Work repo — the image is always the repo's OWN package,
+        # which is the only one that repo's GITHUB_TOKEN can write.
+        include:
+          - suffix: ''
+            dockerfile: Dockerfile
+            context: .
+          - suffix: '-docs'
+            dockerfile: apps/docs/Dockerfile
+            context: .
+    steps:
+      - uses: actions/checkout@v7
+      - uses: docker/setup-buildx-action@v4
+      - uses: docker/login-action@v4
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+      - id: t
+        run: |
+          case "${GITHUB_REF_NAME}" in
+            develop) echo "tag=dev" >> "$GITHUB_OUTPUT" ;;
+            stage) echo "tag=stage" >> "$GITHUB_OUTPUT" ;;
+            main|master) echo "tag=prod" >> "$GITHUB_OUTPUT" ;;
+            *) echo "tag=${GITHUB_REF_NAME//\//-}" >> "$GITHUB_OUTPUT" ;;
+          esac
+      # Not every repo generated from this template carries apps/docs, so the
+      # `-docs` matrix leg must skip cleanly rather than fail the workflow.
+      - id: present
+        run: |
+          if [ -f "${{ matrix.dockerfile }}" ]; then
+            echo "found=true" >> "$GITHUB_OUTPUT"
+          else
+            echo "found=false" >> "$GITHUB_OUTPUT"
+            echo "No ${{ matrix.dockerfile }} in this repo — skipping this image."
+          fi
+      - uses: docker/build-push-action@v7
+        if: steps.present.outputs.found == 'true'
+        with:
+          context: ${{ matrix.context }}
+          file: ${{ matrix.dockerfile }}
+          push: true
+          # Route the in-image dependency install through the internal Verdaccio
+          # cache. The Dockerfile already accepts this build-arg and falls back to
+          # public npm when it is empty (forks, GitHub-hosted builds), so this is
+          # additive. Integrity hashes are still verified by pnpm.
+          #
+          # DOCS_URL / DOCS_HOME_CANONICAL_PATH: the docs image's canonical origin and the page
+          # its site root redirects to (apps/docs/docusaurus.config.ts). They describe ONE
+          # deployment, so they come only from this repository's own Actions variables, which
+          # the platform's template sync does not copy; this file names no host. They reach the
+          # PRODUCTION image only: the :dev and :stage images are served on hosts of their own,
+          # and a dev build naming the production host would make that host an indexable
+          # duplicate whose canonicals point at prod URLs that do not exist yet. Every other
+          # image gets '' and builds noindex, naming no host. The root Dockerfile declares
+          # neither arg and ignores them.
+          #
+          # NEXT_PUBLIC_CANONICAL_URL: the web app's public canonical origin
+          # (apps/web/lib/utils/url-cleaner.ts), from this repository's own SITE_CANONICAL_URL
+          # Actions variable, which survives the template sync. Set it when the production
+          # site answers on more than one host (a brand domain plus the platform host): every
+          # canonical, hreflang, og:url, sitemap, robots and feed URL then names that origin.
+          # Unset or '' = today's behaviour (NEXT_PUBLIC_APP_URL). Production image only, for
+          # the same reason as DOCS_URL: :dev and :stage run on hosts of their own. The docs
+          # Dockerfile does not declare it and ignores it.
+          build-args: |
+            VERDACCIO_REGISTRY=${{ vars.VERDACCIO_REGISTRY }}
+            DOCS_URL=${{ steps.t.outputs.tag == 'prod' && vars.DOCS_URL || '' }}
+            DOCS_HOME_CANONICAL_PATH=${{ steps.t.outputs.tag == 'prod' && vars.DOCS_HOME_CANONICAL_PATH || '' }}
+            NEXT_PUBLIC_CANONICAL_URL=${{ steps.t.outputs.tag == 'prod' && vars.SITE_CANONICAL_URL || '' }}
+          tags: |
+            ghcr.io/${{ github.repository_owner }}/${{ github.event.repository.name }}${{ matrix.suffix }}:${{ steps.t.outputs.tag }}
+            ghcr.io/${{ github.repository_owner }}/${{ github.event.repository.name }}${{ matrix.suffix }}:sha-${{ github.sha }}
+          cache-from: type=registry,ref=ghcr.io/${{ github.repository_owner }}/${{ github.event.repository.name }}${{ matrix.suffix }}:buildcache
+          cache-to: type=registry,ref=ghcr.io/${{ github.repository_owner }}/${{ github.event.repository.name }}${{ matrix.suffix }}:buildcache,mode=max
