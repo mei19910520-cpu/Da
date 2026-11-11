@@ -1,0 +1,256 @@
+import { eq, sql, and } from 'drizzle-orm';
+import { db } from '../drizzle';
+import { users, clientProfiles, accounts, roles, userRoles, type NewUser, type User } from '../schema';
+import { getTenantId } from '@/lib/auth/tenant';
+
+/**
+ * Get user by email address
+ * @param email - User email
+ * @returns User object or null if not found
+ */
+export async function getUserByEmail(email: string): Promise<User | null> {
+	const tenantId = await getTenantId();
+	if (!tenantId) throw new Error('Tenant ID not found');
+
+	// Check if DATABASE_URL is set
+	if (!process.env.DATABASE_URL) {
+		console.warn('DATABASE_URL is not set. User validation is disabled.');
+		return null;
+	}
+
+	try {
+		const usersList = await db
+			.select()
+			.from(users)
+			.where(and(eq(users.email, email), eq(users.tenantId, tenantId)))
+			.limit(1);
+
+		if (usersList.length === 0) {
+			console.warn(`User validation failed: No user found with email ${email}`);
+			return null;
+		}
+
+		return usersList[0];
+	} catch (error) {
+		// Only catch actual database errors
+		console.error('Database error in getUserByEmail:', error);
+		return null;
+	}
+}
+
+/**
+ * Get user by ID
+ * @param id - User ID
+ * @returns User object or null if not found
+ */
+export async function getUserById(id: string): Promise<User | null> {
+	const tenantId = await getTenantId();
+	if (!tenantId) throw new Error('Tenant ID not found');
+
+	if (!process.env.DATABASE_URL) {
+		console.warn('DATABASE_URL is not set. User validation is disabled.');
+		return null;
+	}
+
+	try {
+		const usersList = await db
+			.select()
+			.from(users)
+			.where(and(eq(users.id, id), eq(users.tenantId, tenantId)))
+			.limit(1);
+
+		if (usersList.length === 0) {
+			console.warn(`User validation failed: No user found with id ${id}`);
+			return null;
+		}
+
+		return usersList[0];
+	} catch (error) {
+		// Only catch actual database errors
+		console.error('Database error in getUserById:', error);
+		return null;
+	}
+}
+
+/**
+ * Insert a new user
+ * @param user - New user data
+ * @returns Created user
+ */
+export async function insertNewUser(user: NewUser): Promise<User[]> {
+	const tenantId = await getTenantId();
+	if (!tenantId) throw new Error('Tenant ID not found');
+	return db
+		.insert(users)
+		.values({ ...user, tenantId })
+		.returning();
+}
+
+/**
+ * Update user password
+ * @param newPasswordHash - New password hash
+ * @param userId - User ID
+ */
+export async function updateUserPassword(newPasswordHash: string, userId: string) {
+	const tenantId = await getTenantId();
+	if (!tenantId) throw new Error('Tenant ID not found');
+	return db
+		.update(users)
+		.set({ passwordHash: newPasswordHash })
+		.where(and(eq(users.id, userId), eq(users.tenantId, tenantId)));
+}
+
+/**
+ * Update user details
+ * @param values - User values to update
+ * @param userId - User ID
+ */
+export async function updateUser(values: Pick<NewUser, 'email'>, userId: string) {
+	const tenantId = await getTenantId();
+	if (!tenantId) throw new Error('Tenant ID not found');
+	return db
+		.update(users)
+		.set(values)
+		.where(and(eq(users.id, userId), eq(users.tenantId, tenantId)));
+}
+
+/**
+ * Update user email verification status
+ * @param email - User email
+ * @param verified - Verification status
+ */
+export async function updateUserVerification(email: string, verified: boolean) {
+	const tenantId = await getTenantId();
+	if (!tenantId) throw new Error('Tenant ID not found');
+	return db
+		.update(users)
+		.set({ emailVerified: verified ? new Date() : null })
+		.where(and(eq(users.email, email), eq(users.tenantId, tenantId)));
+}
+
+/**
+ * Hard delete a user. Cascade-deletes everything the user owns (accounts,
+ * clientProfiles, submissions, sponsorships, activityLogs.userId, …). Audit
+ * columns elsewhere that reference users.id with onDelete: 'set null'
+ * (actor_id, reviewed_by, performed_by) keep their rows; only the user link
+ * is nulled, so audit history of OTHER actors' actions is preserved.
+ *
+ * Use this for self-service account deletion from the client Danger Zone.
+ * Use `softDeleteUser` only when the caller specifically wants the email
+ * mangling / deletedAt sentinel behaviour instead.
+ */
+export async function hardDeleteUser(userId: string) {
+	const tenantId = await getTenantId();
+	if (!tenantId) throw new Error('Tenant ID not found');
+	return db.delete(users).where(and(eq(users.id, userId), eq(users.tenantId, tenantId)));
+}
+
+/**
+ * Soft delete a user by marking as deleted
+ * @param userId - User ID to delete
+ *
+ * Also neuters the user's rows in the `accounts` table so the credentials
+ * provider (which authenticates against accounts.email + accounts.passwordHash
+ * via verifyClientPassword) cannot mint a fresh session for a soft-deleted
+ * user. Without this, login by the original email keeps succeeding because
+ * the accounts row is untouched.
+ */
+export async function softDeleteUser(userId: string) {
+	const tenantId = await getTenantId();
+	if (!tenantId) throw new Error('Tenant ID not found');
+
+	return db.transaction(async (tx) => {
+		await tx
+			.update(users)
+			.set({
+				deletedAt: sql`CURRENT_TIMESTAMP`,
+				email: sql`CONCAT(email, '-', id, '-deleted')`
+			})
+			.where(and(eq(users.id, userId), eq(users.tenantId, tenantId)));
+
+		await tx
+			.update(accounts)
+			.set({
+				email: sql`CONCAT(COALESCE(${accounts.email}, ''), '-', ${accounts.userId}, '-deleted')`,
+				passwordHash: null
+			})
+			.where(and(eq(accounts.userId, userId), eq(accounts.tenantId, tenantId)));
+	});
+}
+
+/**
+ * Deactivate a user account (reversible soft-pause).
+ * Sets deactivatedAt to the current timestamp. The user's email and credentials
+ * remain intact so they can log back in and reactivate. This is separate from
+ * softDeleteUser / hardDeleteUser which are not reversible.
+ */
+export async function deactivateUser(userId: string) {
+	const tenantId = await getTenantId();
+	if (!tenantId) throw new Error('Tenant ID not found');
+	return db
+		.update(users)
+		.set({ deactivatedAt: sql`CURRENT_TIMESTAMP`, updatedAt: new Date() })
+		.where(and(eq(users.id, userId), eq(users.tenantId, tenantId)));
+}
+
+/**
+ * Reactivate a previously deactivated user account.
+ * Clears deactivatedAt, restoring the account to active status.
+ */
+export async function reactivateUser(userId: string) {
+	const tenantId = await getTenantId();
+	if (!tenantId) throw new Error('Tenant ID not found');
+	return db
+		.update(users)
+		.set({ deactivatedAt: null, updatedAt: new Date() })
+		.where(and(eq(users.id, userId), eq(users.tenantId, tenantId)));
+}
+
+/**
+ * Update client profile name
+ * @param userId - User ID
+ * @param name - New name
+ */
+export async function updateClientProfileName(userId: string, name: string) {
+	const tenantId = await getTenantId();
+	if (!tenantId) throw new Error('Tenant ID not found');
+	return db
+		.update(clientProfiles)
+		.set({ name, updatedAt: new Date() })
+		.where(and(eq(clientProfiles.userId, userId), eq(clientProfiles.tenantId, tenantId)));
+}
+
+/**
+ * Check if a user has an admin role
+ * @param userId - User ID
+ * @returns true if user has an admin role, false otherwise
+ */
+export async function isUserAdmin(userId: string): Promise<boolean> {
+	if (!process.env.DATABASE_URL) {
+		console.warn('DATABASE_URL is not set. Admin check is disabled.');
+		return false;
+	}
+
+	try {
+		const tenantId = await getTenantId();
+		if (!tenantId) throw new Error('Tenant ID not found');
+		const result = await db
+			.select({ isAdmin: roles.isAdmin })
+			.from(userRoles)
+			.innerJoin(roles, eq(userRoles.roleId, roles.id))
+			.where(
+				and(
+					eq(userRoles.userId, userId),
+					eq(roles.isAdmin, true),
+					eq(roles.status, 'active'),
+					eq(userRoles.tenantId, tenantId)
+				)
+			)
+			.limit(1);
+
+		return result.length > 0;
+	} catch (error) {
+		console.error('Database error in isUserAdmin:', error);
+		return false;
+	}
+}
