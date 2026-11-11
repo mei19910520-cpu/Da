@@ -1,0 +1,81 @@
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+    name: ${WORK_SLUG}
+    namespace: ${NAMESPACE}
+    labels:
+        ever-works.io/managed: "true"
+        ever-works.io/work-id: "${WORK_ID}"
+        app.kubernetes.io/name: ${WORK_SLUG}
+        app.kubernetes.io/managed-by: ever-works-k8s-plugin
+spec:
+    replicas: ${REPLICAS}
+    selector:
+        matchLabels:
+            app.kubernetes.io/name: ${WORK_SLUG}
+    strategy:
+        type: RollingUpdate
+        rollingUpdate:
+            maxSurge: 1
+            maxUnavailable: 0
+    template:
+        metadata:
+            labels:
+                ever-works.io/managed: "true"
+                ever-works.io/work-id: "${WORK_ID}"
+                app.kubernetes.io/name: ${WORK_SLUG}
+                app.kubernetes.io/managed-by: ever-works-k8s-plugin
+        spec:
+            ${PULL_SECRET_BLOCK}
+            containers:
+                - name: app
+                  image: ${IMAGE}
+                  imagePullPolicy: IfNotPresent
+                  ports:
+                      - containerPort: 3000
+                        name: http
+                  startupProbe:
+                      httpGet:
+                          path: /
+                          port: http
+                      periodSeconds: 10
+                      timeoutSeconds: 5
+                      failureThreshold: 30
+                  readinessProbe:
+                      httpGet:
+                          path: /
+                          port: http
+                      periodSeconds: 10
+                      timeoutSeconds: 15
+                      failureThreshold: 3
+                  livenessProbe:
+                      httpGet:
+                          path: /
+                          port: http
+                      periodSeconds: 15
+                      timeoutSeconds: 15
+                      failureThreshold: 10
+                  # Sized for a directory site that runs a background
+                  # repository sync (every 5 min in local-scheduler mode) on
+                  # top of the Next.js heap. The previous 1Gi limit + 5s probe
+                  # timeout was killing pods during the sync window when
+                  # serving 600KB+ HTML and 2.6MB cache items pushed memory
+                  # and CPU briefly past the previous caps.
+                  resources:
+                      requests:
+                          cpu: 200m
+                          memory: 384Mi
+                      limits:
+                          cpu: 1500m
+                          memory: 1500Mi
+                  envFrom:
+                      - secretRef:
+                          name: ${WORK_SLUG}-runtime-env
+                          optional: true
+                  env:
+                      - name: NODE_ENV
+                        value: production
+                      - name: PORT
+                        value: "3000"
+                      - name: HOSTNAME
+                        value: 0.0.0.0
