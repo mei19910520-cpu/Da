@@ -1,0 +1,96 @@
+import { Link } from '@/i18n/navigation';
+import { ThemeToggler } from '../theme-toggler';
+import { Container } from '../ui/container';
+import { VersionDisplay, VersionTooltip } from '../version';
+import { SiteLogo } from '../shared/site-logo';
+import { processFooterItems } from '@/lib/utils/footer-utils';
+import type { Config, FooterSettings } from '@/lib/content';
+
+interface FooterBottomProps {
+	config: Config;
+	t: (key: string) => string;
+	footerSettings: FooterSettings;
+}
+
+export function FooterBottom({ config, t, footerSettings }: FooterBottomProps) {
+	// Process footer items: use custom footer items if available, otherwise use default links
+	const footerItems = processFooterItems(config, t);
+
+	return (
+		<div className="relative backdrop-blur-xl bg-white/5 dark:bg-white/[0.02] border-t border-gray-200/30 dark:border-white/6">
+			<Container maxWidth="7xl" padding="default" useGlobalWidth className="relative px-4 sm:px-6 lg:px-8 py-6">
+				<div className="flex flex-col gap-4">
+					{/* Top row: Logo and disclaimer */}
+					<div className="flex flex-col lg:flex-row items-start lg:items-center gap-4">
+						<div className="shrink-0">
+							<SiteLogo size="lg" showText={true} />
+						</div>
+
+						{/* Disclaimer - smaller text, can be wider now */}
+						<div className="text-[10px] sm:text-xs text-gray-400 dark:text-gray-500 leading-relaxed flex-1">
+							{t('footer.DISCLAIMER')}
+						</div>
+					</div>
+
+					{/* Bottom row: Copyright, links, version, theme */}
+					<div className="flex flex-col sm:flex-row items-start sm:items-center justify-between gap-3 pt-3 border-t border-gray-200/30 dark:border-white/6">
+						{/* Left side: Copyright and legal links */}
+						<div className="flex flex-wrap items-center gap-x-3 gap-y-2 text-gray-600 dark:text-gray-400">
+							{/*
+								`new Date().getFullYear()` is computed at SSR/SSG time, then
+								hydrated on the client. If the cached HTML was generated in a
+								different year than the visitor's clock (or the build runs
+								around midnight UTC on Dec 31), React 18+ throws #418
+								(text-content hydration mismatch). suppressHydrationWarning
+								tells React to trust the server-rendered year.
+							*/}
+							<span className="text-xs font-medium" suppressHydrationWarning>
+								Copyright &copy; {config.copyright_year || new Date().getFullYear()}{' '}
+								{config.company_name}. {t('footer.ALL_RIGHTS_RESERVED')}.
+							</span>
+							{footerItems.length > 0 && (
+								<>
+									<span className="hidden sm:inline text-gray-400 dark:text-gray-600">·</span>
+									{footerItems.map((item, index) => (
+										<Link
+											key={index}
+											href={item.href}
+											target={item.target}
+											rel={item.rel}
+											className="text-xs hover:text-gray-900 dark:hover:text-white transition-colors duration-200"
+										>
+											{index > 0 && (
+												<span className="mr-2 text-gray-400 dark:text-gray-600">·</span>
+											)}
+											{item.label}
+										</Link>
+									))}
+								</>
+							)}
+						</div>
+
+						{/* Right side: Version and theme toggle */}
+						{(footerSettings.versionEnabled || footerSettings.themeSelectorEnabled) && (
+							<div className="flex items-center gap-3">
+								{footerSettings.versionEnabled && (
+									<VersionTooltip>
+										<div className="group cursor-help">
+											<VersionDisplay
+												variant="inline"
+												className="text-xs text-gray-400 dark:text-gray-500 group-hover:text-gray-700 dark:group-hover:text-gray-300 transition-colors duration-200"
+											/>
+										</div>
+									</VersionTooltip>
+								)}
+								{footerSettings.versionEnabled && footerSettings.themeSelectorEnabled && (
+									<div className="w-px h-4 bg-gray-300 dark:bg-white/8" />
+								)}
+								{footerSettings.themeSelectorEnabled && <ThemeToggler openUp />}
+							</div>
+						)}
+					</div>
+				</div>
+			</Container>
+		</div>
+	);
+}
