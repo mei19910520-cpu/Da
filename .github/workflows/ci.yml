@@ -1,0 +1,93 @@
+name: Web CI
+permissions:
+  contents: read
+on:
+  push:
+    branches: [main, develop]
+  pull_request:
+    branches: [main, develop]
+  workflow_dispatch:
+
+concurrency:
+  group: ${{ github.ref }}-${{ github.workflow }}
+  cancel-in-progress: true
+
+jobs:
+  lint-and-build:
+    # Template-only. Every repo generated from this template receives this
+    # workflow verbatim (the platform force-pushes template branches), and
+    # running the full web lint+build in each of them burned self-hosted
+    # runners without gating anything a Work owner acts on. Gated rather than
+    # deleted so the template keeps its own CI and a sync can never "restore"
+    # a version that runs everywhere. Instance default branches are
+    # unprotected, so a skipped job cannot leave a required check pending.
+    if: github.repository == 'ever-works/directory-web-template'
+    name: Lint and Build Web
+    runs-on: ${{ vars.RUNNER_LINUX_X64_4 || 'ubuntu-latest' }}
+
+    env:
+      NEXT_PUBLIC_APP_URL: http://localhost:3000
+      DATABASE_URL: postgresql://postgres:postgres@localhost:5432/postgres
+      AUTH_SECRET: 'ci-test-secret-not-for-production'
+      DATA_REPOSITORY: 'ci-test-repo-not-used'
+      CONTENT_WARNINGS_SILENT: 'true'
+      CI: 'true'
+
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v7
+
+      - name: Setup pnpm
+        uses: pnpm/action-setup@v6
+
+      - name: Setup Node.js
+        uses: actions/setup-node@v7
+        with:
+          node-version: '24'
+          cache: pnpm
+
+      - name: Install dependencies
+        run: pnpm install
+
+      - name: Run lint
+        run: pnpm run lint
+        continue-on-error: ${{ github.event_name == 'pull_request' }}
+
+      - name: Type check
+        run: pnpm run --filter @ever-works/web typecheck || echo "No type check script found, skipping"
+
+      - name: Create content directories
+        run: |
+          mkdir -p apps/web/.content/data
+          echo "Created content directories for build"
+
+      - name: Build web
+        run: pnpm run build:web 2> >(grep -v "DATA_REPOSITORY\|AUTH CONFIG WARNING" >&2 || true)
+        env:
+          NEXT_PUBLIC_APP_URL: ${{ env.NEXT_PUBLIC_APP_URL }}
+          AUTH_SECRET: ${{ env.AUTH_SECRET }}
+          NEXT_PUBLIC_SUPABASE_URL: ${{ secrets.NEXT_PUBLIC_SUPABASE_URL }}
+          NEXT_PUBLIC_SUPABASE_ANON_KEY: ${{ secrets.NEXT_PUBLIC_SUPABASE_ANON_KEY }}
+          SUPABASE_SERVICE_ROLE_KEY: ${{ secrets.SUPABASE_SERVICE_ROLE_KEY }}
+          DATABASE_URL: ${{ secrets.DATABASE_URL || env.DATABASE_URL }}
+          GOOGLE_CLIENT_ID: ${{ secrets.GOOGLE_CLIENT_ID || '' }}
+          GOOGLE_CLIENT_SECRET: ${{ secrets.GOOGLE_CLIENT_SECRET || '' }}
+          GITHUB_CLIENT_ID: ${{ secrets.GITHUB_CLIENT_ID || '' }}
+          GITHUB_CLIENT_SECRET: ${{ secrets.GITHUB_CLIENT_SECRET || '' }}
+          FB_CLIENT_ID: ${{ secrets.FACEBOOK_CLIENT_ID || '' }}
+          FB_CLIENT_SECRET: ${{ secrets.FACEBOOK_CLIENT_SECRET || '' }}
+          TWITTER_CLIENT_ID: ${{ secrets.TWITTER_CLIENT_ID || '' }}
+          TWITTER_CLIENT_SECRET: ${{ secrets.TWITTER_CLIENT_SECRET || '' }}
+          DATA_REPOSITORY: ${{ secrets.DATA_REPOSITORY || '' }}
+          GH_TOKEN: ${{ secrets.GH_TOKEN || '' }}
+          RESEND_API_KEY: ${{ secrets.RESEND_API_KEY || '' }}
+          EMAIL_FROM: ${{ secrets.EMAIL_FROM || 'info@ever.works' }}
+
+      - name: Check for web build success
+        run: |
+          if [ -d "apps/web/.next" ]; then
+            echo "✅ Web build successful"
+          else
+            echo "❌ Web build failed"
+            exit 1
+          fi
