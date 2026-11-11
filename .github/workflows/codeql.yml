@@ -1,0 +1,89 @@
+name: "CodeQL Security Analysis"
+
+on:
+  push:
+    branches: [ "main", "develop" ]
+  pull_request:
+    branches: [ "main", "develop" ]
+  schedule:
+    - cron: '0 6 * * 1'  # Weekly on Monday at 6 AM
+  workflow_dispatch:  # Allow manual triggering
+
+concurrency:
+  group: ${{ github.ref }}-${{ github.workflow }}
+  cancel-in-progress: true
+
+jobs:
+  analyze:
+    name: Analyze (${{ matrix.language }})
+    runs-on: ubuntu-latest
+    timeout-minutes: 360
+    permissions:
+      actions: read
+      contents: read
+      security-events: write
+      pull-requests: read
+
+    strategy:
+      fail-fast: false
+      matrix:
+        language: [ 'javascript-typescript' ]
+
+    steps:
+    - name: Checkout repository
+      uses: actions/checkout@v4
+
+    - name: Setup pnpm
+      uses: pnpm/action-setup@v4
+
+    - name: Setup Node.js
+      uses: actions/setup-node@v4
+      with:
+        node-version: '24'
+        cache: pnpm
+
+    - name: Initialize CodeQL
+      uses: github/codeql-action/init@v3
+      with:
+        languages: ${{ matrix.language }}
+
+    - name: Setup CodeQL environment
+      run: node apps/web/scripts/codeql-setup.js
+
+    - name: Install dependencies
+      run: pnpm install
+
+    - name: Autobuild
+      uses: github/codeql-action/autobuild@v3
+      env:
+        # Environment variables for build
+        NEXT_PUBLIC_APP_URL: ${{ secrets.NEXT_PUBLIC_APP_URL || 'http://localhost:3000' }}
+        DATABASE_URL: ${{ secrets.DATABASE_URL || 'postgresql://postgres:postgres@localhost:5432/postgres' }}
+        AUTH_SECRET: ${{ secrets.AUTH_SECRET || 'ci-test-secret-not-for-production' }}
+        DATA_REPOSITORY: ${{ secrets.DATA_REPOSITORY || 'codeql-test-repo' }}
+        CONTENT_WARNINGS_SILENT: "true"
+        CI: "true"
+
+    - name: Perform CodeQL Analysis with Upload
+      id: analyze-upload
+      uses: github/codeql-action/analyze@v3
+      continue-on-error: true
+
+    - name: Perform CodeQL Analysis without Upload (Fallback)
+      if: steps.analyze-upload.outcome == 'failure'
+      uses: github/codeql-action/analyze@v3
+      with:
+        upload: false
+
+    - name: Report Analysis Status
+      run: |
+        if [ "${{ steps.analyze-upload.outcome }}" == "success" ]; then
+          echo "✅ CodeQL analysis completed with upload to GitHub Security"
+          echo "📊 Results available in: GitHub → Security → Code scanning"
+        else
+          echo "⚠️  CodeQL analysis completed without upload (fallback mode)"
+          echo "🔧 To enable uploads, configure GitHub Security settings:"
+          echo "   1. Go to Settings → Security → Code security and analysis"
+          echo "   2. Configure Code scanning appropriately"
+          echo "   3. Ensure no conflicting configurations"
+        fi
