@@ -1,0 +1,229 @@
+import 'server-only';
+
+import * as os from 'os';
+import * as path from 'path';
+import * as fs from 'fs/promises';
+import { hasContentConfigFile } from './content-config-file';
+
+export function getContentPath() {
+    const contentDir = '.content';
+
+    // During build phase on Vercel, use source directory directly
+    // At runtime, use /tmp because build artifact is read-only
+    const isBuildPhase = process.env.NEXT_PHASE === 'phase-production-build';
+
+    if (process.env.VERCEL && !isBuildPhase) {
+        return path.join(os.tmpdir(), contentDir);
+    }
+
+    return path.join(process.cwd(), contentDir);
+}
+
+// Use globalThis for singleton state to persist across module reloads in serverless
+const CONTENT_INIT_KEY = '__CONTENT_INIT__' as const;
+
+interface ContentInitState {
+    initialized: boolean;
+    promise: Promise<string> | null;
+}
+
+function getContentInitState(): ContentInitState {
+    const g = globalThis as typeof globalThis & { [CONTENT_INIT_KEY]?: ContentInitState };
+    if (!g[CONTENT_INIT_KEY]) {
+        g[CONTENT_INIT_KEY] = {
+            initialized: false,
+            promise: null
+        };
+    }
+    return g[CONTENT_INIT_KEY];
+}
+
+/**
+ * Check if content directory has actual content (not just empty directory)
+ */
+async function hasContentFiles(contentPath: string): Promise<boolean> {
+    return hasContentConfigFile(contentPath);
+}
+
+async function hasUsableContent(contentPath: string): Promise<boolean> {
+    if (!(await hasContentFiles(contentPath))) {
+        return false;
+    }
+
+    if (!process.env.DATA_REPOSITORY) {
+        return true;
+    }
+
+    try {
+        await fs.access(path.join(contentPath, '.git'));
+        return true;
+    } catch {
+        return false;
+    }
+}
+
+function getBundledContentPath(): string {
+    return path.join(process.cwd(), '.content');
+}
+
+async function hydrateRuntimeContentFromBundle(runtimeContentPath: string): Promise<boolean> {
+    const bundledContentPath = getBundledContentPath();
+
+    if (!(await hasUsableContent(bundledContentPath))) {
+        return false;
+    }
+
+    const tempContentPath = path.join(
+        path.dirname(runtimeContentPath),
+        `${path.basename(runtimeContentPath)}.${process.pid}.${Date.now()}.tmp`
+    );
+
+    try {
+        console.log('[CONTENT] Hydrating runtime content from bundled deployment artifact...');
+        await fs.rm(tempContentPath, { recursive: true, force: true });
+        await fs.mkdir(path.dirname(tempContentPath), { recursive: true });
+        await fs.cp(bundledContentPath, tempContentPath, { recursive: true });
+        await replaceDirectoryAtomically(runtimeContentPath, tempContentPath);
+        return await hasUsableContent(runtimeContentPath);
+    } catch (error) {
+        console.error('[CONTENT] Failed to hydrate runtime content from bundled artifact:', error);
+        await fs.rm(tempContentPath, { recursive: true, force: true }).catch(() => {});
+        return false;
+    }
+}
+
+export async function replaceDirectoryAtomically(targetPath: string, replacementPath: string): Promise<void> {
+    const backupPath = path.join(
+        path.dirname(targetPath),
+        `${path.basename(targetPath)}.${process.pid}.${Date.now()}.backup`
+    );
+
+    let hasBackup = false;
+
+    try {
+        await fs.rm(backupPath, { recursive: true, force: true });
+
+        try {
+            await fs.rename(targetPath, backupPath);
+            hasBackup = true;
+        } catch (error) {
+            if (!(error instanceof Error && 'code' in error && error.code === 'ENOENT')) {
+                throw error;
+            }
+        }
+
+        await fs.rename(replacementPath, targetPath);
+        await fs.rm(backupPath, { recursive: true, force: true });
+    } catch (error) {
+        if (hasBackup) {
+            await fs.rm(targetPath, { recursive: true, force: true }).catch(() => {});
+            await fs.rename(backupPath, targetPath).catch(() => {});
+        }
+        throw error;
+    }
+}
+
+/**
+ * Ensures content directory is available at runtime.
+ * 
+ * ARCHITECTURE (Clone Instead of Copy):
+ * - On Vercel: Returns /tmp/.content path. Content is cloned from Git on first access.
+ * - Locally: Returns .content path directly.
+ * - NO COPYING from build artifact - each container clones fresh from Git.
+ * 
+ * Benefits:
+ * - All containers get latest content from Git (not stale build artifact)
+ * - No slow copy operation on startup
+ * - Git is the single source of truth
+ * 
+ * Flow:
+ * 1. First request to cold container calls this function
+ * 2. If content doesn't exist, triggers trySyncRepository() to clone from Git
+ * 3. Subsequent requests use cached content (fast)
+ * 
+ * @returns Promise<string> - The content path to use
+ */
+export async function ensureContentAvailable(): Promise<string> {
+    const state = getContentInitState();
+    const contentPath = getContentPath();
+    const isBuildPhase = process.env.NEXT_PHASE === 'phase-production-build';
+    const isVercelRuntime = !!process.env.VERCEL && !isBuildPhase;
+
+    // If already initialized and has content, return immediately
+    if (state.initialized && (await hasUsableContent(contentPath))) {
+        return contentPath;
+    }
+
+    // If initialization is in progress, wait for it
+    if (state.promise) {
+        return state.promise;
+    }
+
+    // Start initialization
+    state.promise = (async () => {
+        // Ensure directory exists
+        try {
+            await fs.mkdir(contentPath, { recursive: true });
+        } catch {
+            // Directory might already exist, that's fine
+        }
+
+        // Check if content actually exists (not just empty directory)
+        let hasContent = await hasUsableContent(contentPath);
+
+        if (!hasContent && isVercelRuntime) {
+            hasContent = await hydrateRuntimeContentFromBundle(contentPath);
+        }
+        
+        if (!hasContent) {
+            // Content doesn't exist - need to clone from Git
+            // This happens on first request to a cold container if the bundled
+            // deployment artifact is unavailable or stale.
+            console.log('[CONTENT] No content found, triggering repository sync...');
+            
+            try {
+                // Dynamic import to avoid circular dependencies
+                const { trySyncRepository } = await import('./repository');
+                await trySyncRepository();
+                console.log('[CONTENT] Repository sync completed');
+            } catch (error) {
+                console.error('[CONTENT] Repository sync failed:', error);
+                // Don't throw - let the caller handle missing content gracefully
+            }
+        }
+
+        const contentReady = await hasUsableContent(contentPath);
+        state.initialized = contentReady;
+
+        if (!contentReady) {
+            console.warn('[CONTENT] Content is still unavailable after initialization attempt; will retry on next request.');
+        }
+
+        return contentPath;
+    })().finally(() => {
+        state.promise = null;
+    });
+
+    return state.promise;
+}
+
+export async function fsExists(filepath: string): Promise<boolean> {
+    try {
+        await fs.access(filepath);
+        return true;
+    } catch {
+        return false;
+    }
+}
+
+export async function dirExists(dirpath: string) {
+    try {
+        const stat = await fs.stat(dirpath);
+        return stat.isDirectory();
+    } catch (err) {
+        if (err instanceof Error && 'code' in err && err.code === 'ENOENT') {
+            return false;
+        }
+        throw err;
+    }
+}
