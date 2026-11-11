@@ -1,0 +1,89 @@
+"use client";
+
+import { Category, ItemData, Tag } from "@/lib/content";
+import { HomeTwoFilters } from "./home-two-filters";
+import { useLayoutTheme } from "../context";
+import { useStickyState } from "@/hooks/use-sticky-state";
+import { ListingClient } from "../shared-card/listing-client";
+import { CardPresets } from "../shared-card";
+import { Container } from "../ui/container";
+import clsx from "clsx";
+
+// Style constants for sticky header
+const STICKY_CONTAINER_BASE = clsx(
+  "sticky top-16 z-20",
+  "transition-all duration-300 ease-in-out",
+  "border border-transparent",
+  "rounded-x-lg rounded-b-lg",
+  "bg-white/95 dark:bg-[#0a0a0a]",
+  "backdrop-blur-xs",
+);
+
+const STICKY_CONTAINER_ACTIVE = clsx(
+  STICKY_CONTAINER_BASE,
+  "bg-white/95 dark:bg-[#0a0a0a]/95",
+  "shadow-md backdrop-blur-xs",
+  "border border-gray-100 dark:border-white/6",
+  "px-4 pt-1.5"
+);
+
+const STICKY_CONTAINER_INACTIVE = clsx(
+  STICKY_CONTAINER_BASE,
+  "bg-transparent"
+);
+
+type Home2LayoutProps = {
+  total: number;
+  start: number;
+  page: number;
+  basePath: string;
+  categories?: Category[];
+  tags: Tag[];
+  items: ItemData[];
+  filteredAndSortedItems: ItemData[];
+  searchEnabled?: boolean;
+};
+
+export function HomeTwoLayout(props: Home2LayoutProps) {
+  const { layoutKey, setLayoutKey, itemsPerPage } = useLayoutTheme();
+  const categories = props.categories ?? [];
+  const { isSticky, sentinelRef, targetRef } = useStickyState({
+    threshold: 0,
+    rootMargin: "-20px 0px 0px 0px",
+  });
+
+  return (
+    <div className="min-h-screen transition-colors duration-300 pt-[30px] lg:pt-0">
+      <Container maxWidth="7xl" padding="default" useGlobalWidth className="flex flex-col gap-3 py-8">
+        <div ref={sentinelRef} className="md:h-4 md:w-full" />
+        <div
+          ref={targetRef}
+          className={isSticky ? STICKY_CONTAINER_ACTIVE : STICKY_CONTAINER_INACTIVE}
+        >
+          <HomeTwoFilters
+            categories={categories}
+            tags={props.tags}
+            layoutKey={layoutKey}
+            setLayoutKey={setLayoutKey}
+            // Was `props.items.length` — that's the current-page slice (~12)
+            // since Spec 020. `props.total` is the catalogue-wide filtered total.
+            totalCount={props.total}
+            filteredCount={props.filteredAndSortedItems.length}
+            searchEnabled={props.searchEnabled}
+            isSticky={isSticky}
+          />
+        </div>
+        <ListingClient
+          total={props.total}
+          start={props.start}
+          page={props.page}
+          basePath={props.basePath}
+          categories={categories}
+          tags={props.tags}
+          items={props.filteredAndSortedItems}
+          config={{ ...CardPresets.homeTwoListing, perPage: itemsPerPage }}
+        />
+      </Container>
+    </div>
+  );
+}
